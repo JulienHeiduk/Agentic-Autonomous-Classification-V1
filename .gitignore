@@ -1,0 +1,29 @@
+# Secrets. Never commit these.
+secrets.yml
+secrets.*.yml
+!secrets.example.yml
+.env
+.env.*
+kaggle.json
+
+# Run artifacts and cached competition data.
+runs/
+
+# Python.
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors and OS.
+.vscode/
+.idea/
+.DS_Store
+.claude

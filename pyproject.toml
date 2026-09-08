@@ -1,0 +1,50 @@
+[project]
+name = "aac"
+version = "0.1.0"
+description = "Agentic Autonomous Classification: LLM-planned, CV-validated tabular classification autopilot for Kaggle."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.28.1,<1",
+    "pandas>=3.0.5,<4",
+    "numpy>=2.5.2,<3",
+    "scikit-learn>=1.9.0,<2",
+    "lightgbm>=4.7.0,<5",
+    "xgboost>=3.4.1,<4",
+    "catboost>=1.2.10,<2",
+    "pyyaml>=6.0.3,<7",
+    "pydantic>=2.13.5,<3",
+    "rich>=15.0.0,<16",
+    "optuna>=4.9.0,<5",
+    # pyarrow: parquet I/O for cached competition data and branch artifacts (README section 2).
+    "pyarrow>=25.0.1,<26",
+    "torch>=2.14.0",
+]
+
+[project.scripts]
+aac = "aac.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aac"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

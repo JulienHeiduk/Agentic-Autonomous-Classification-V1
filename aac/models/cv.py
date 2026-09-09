@@ -111,7 +111,10 @@ def _target_encode(
     )
 
     def attach(frame: pd.DataFrame, values: np.ndarray) -> pd.DataFrame:
-        out = frame.drop(columns=columns)
+        # A category column is replaced by its encoding; a numeric one (an integer treated as
+        # a level set) keeps its order information alongside the encoding.
+        replaced = [c for c in columns if not pd.api.types.is_numeric_dtype(frame[c])]
+        out = frame.drop(columns=replaced)
         for i, name in enumerate(names):
             out[name] = values[:, i]
         return out

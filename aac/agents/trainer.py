@@ -114,22 +114,30 @@ def train_plan(
     n_jobs: int,
     branch_dir: Path,
     max_trees: int | None = None,
+    families: list[str] | None = None,
 ) -> TrainResult:
+    """Train every family of the plan (or only ``families``) on the shared folds."""
     started = time.monotonic()
     n_classes = len(profile.target.classes)
     features, categorical = select_features(plan, profile, train, test)
     matrix: Matrix = prepare_matrix(train, test, features, categorical)
+    models = [m for m in plan.models if families is None or m.family in families]
+    if not models:
+        raise ValueError(f"plan {plan.name!r} has none of the families {families}")
     log.info(
-        "training plan %s: %d features (%d categorical), %d rows, %d families",
+        "training plan %s (seed %d): %d features (%d categorical, %d target-encoded), "
+        "%d rows, %d families",
         plan.name,
+        seed,
         len(features),
         len(categorical),
+        len(plan.target_encode),
         len(train),
-        len(plan.models),
+        len(models),
     )
     results: dict[str, CVResult] = {}
     errors: dict[str, str] = {}
-    for model in plan.models:
+    for model in models:
         params = plan.resolved_params(model, max_trees)
         try:
             result = cross_validate(

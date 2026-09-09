@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from aac.agents.ensembler import LivePool, PoolUpdate
-from aac.agents.researcher import parse_reply, render_history, run_researcher
+from aac.agents.researcher import Experiment, parse_reply, render_history, run_researcher
 from aac.agents.scout import profile_data
 from aac.config import CompetitionConfig, ResearcherSpec, load_config
 from aac.context import RunContext
@@ -75,7 +75,7 @@ def setup(tmp_path, write_config, minimal_config, monkeypatch):
     return ctx, profile, y, folds, train_path, test_path
 
 
-def run(setup, fake, track="open", rounds=None, pool=None, after_experiment=None, team=None):
+def run(setup, fake, track="open", rounds=None, pool=None, after_experiment=None, team=None, **kw):
     ctx, profile, y, folds, train_path, test_path = setup
     router = Router(
         ctx.config,
@@ -100,7 +100,52 @@ def run(setup, fake, track="open", rounds=None, pool=None, after_experiment=None
         pool=pool,
         after_experiment=after_experiment,
         team=team,
+        **kw,
     )
+
+
+def test_history_counters_match_the_loop():
+    from aac.agents.researcher import history_counters
+    from aac.exec.sandbox import ExperimentResult
+
+    def exp(ok, score=None, gain=None):
+        e = Experiment("id", "a", 1, "h", "c", "b", "m")
+        e.result = ExperimentResult(ok, "ok" if ok else "error", oof_score=score)
+        e.pool_gain = gain
+        return e
+
+    auc = METRICS["auc"]
+    assert history_counters([], auc, 0.001) == (0, 0)
+    assert history_counters([exp(False), exp(False)], auc, 0.001) == (2, 2)
+    # improve, stall, stall -> 2 rounds since the improvement, no failures
+    assert history_counters([exp(True, 0.8), exp(True, 0.8), exp(True, 0.8001)], auc, 0.001) == (
+        2,
+        0,
+    )
+    # a pool gain counts as an improvement even when the single score did not move
+    assert history_counters([exp(True, 0.8), exp(True, 0.79, gain=0.01)], auc, 0.001) == (0, 0)
+    # a failure after a success: one failure, and it also counts as a round without gain
+    assert history_counters([exp(True, 0.8), exp(False)], auc, 0.001) == (1, 1)
+
+
+def test_until_round_steps_one_round_at_a_time(setup):
+    ctx = setup[0]
+    fake = FakeLLM({"nv.test": [reply("one", LOGISTIC), reply("two", WEAK), reply("three", WEAK)]})
+    first = run(setup, fake, rounds=3, until_round=1)
+    assert [e.round for e in first.experiments] == [1] and first.stopped_because == ""
+    prompt = fake.calls("nv.test")[0]["messages"][-1]["content"]
+    assert "Time: " in prompt and "minutes of wall clock remain" in prompt
+    assert "Round 1 of 3" in prompt
+    second = run(setup, fake, rounds=3, until_round=2, history=first.experiments)
+    assert [e.round for e in second.experiments] == [1, 2] and second.stopped_because == ""
+    # patience (2) is counted across calls: round 2 and 3 did not improve on round 1
+    rest = run(setup, fake, rounds=3, until_round=3, history=second.experiments)
+    assert [e.round for e in rest.experiments] == [1, 2, 3]
+    assert rest.stopped_because == "no improvement for 2 rounds"
+    assert rest.best is first.experiments[0]
+    assert "Round 2 of 3" in fake.calls("nv.test")[1]["messages"][-1]["content"]
+    rows = ctx.ledger.list_experiments(ctx.run_id, rest.agent)
+    assert [r["round"] for r in rows] == [1, 2, 3]
 
 
 def test_loop_records_improves_feeds_back_errors_and_stops_on_patience(setup):

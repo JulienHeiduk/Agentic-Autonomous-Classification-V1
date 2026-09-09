@@ -137,3 +137,73 @@ def test_per_backend_concurrency_limit(config, tmp_path):
     for t in threads:
         t.join()
     assert active["peak"] == 1
+
+
+def test_circuit_breaker_skips_a_tripped_backend_until_cooldown(config, tmp_path):
+    clock = {"t": 0.0}
+    fake = FakeLLM(
+        {"nv.test": [503] * 8 + ["nv back"], "local.test": ["local 1", "local 2", "local 3"]}
+    )
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.create_run("r1", "s", "h", None)
+    router = Router(
+        config,
+        ledger=ledger,
+        run_id="r1",
+        client=httpx.Client(transport=fake.transport),
+        sleep=lambda s: None,
+        clock=lambda: clock["t"],
+    )
+    # two calls exhaust their four attempts each on nvidia: the breaker trips (trip_after 2)
+    assert router.complete(MSGS, agent="a", tier="reason").content == "local 1"
+    assert not router.is_down("nvidia")
+    assert router.complete(MSGS, agent="a", tier="reason").content == "local 2"
+    assert router.is_down("nvidia") and len(fake.calls("nv.test")) == 8
+    # while it cools down, a call goes straight to the fallback without touching nvidia
+    assert router.complete(MSGS, agent="a", tier="reason").content == "local 3"
+    assert len(fake.calls("nv.test")) == 8
+    last = ledger.list_llm_calls("r1")[-1]
+    assert last["backend"] == "local" and last["escalated"] == 1
+    # after the cooldown nvidia is tried again and a success resets the count
+    clock["t"] = 601.0
+    assert not router.is_down("nvidia")
+    assert router.complete(MSGS, agent="a", tier="reason").content == "nv back"
+    assert len(fake.calls("nv.test")) == 9
+
+
+def test_non_retryable_errors_do_not_trip_the_breaker(config, tmp_path):
+    fake = FakeLLM({"nv.test": [404, 404, 404], "local.test": ["l"] * 3})
+    router = make(config, fake, tmp_path)
+    for _ in range(3):
+        assert router.complete(MSGS, agent="a", tier="reason").content == "l"
+    assert not router.is_down("nvidia") and len(fake.calls("nv.test")) == 3
+
+
+def test_fallback_pair_on_the_same_backend(write_config, minimal_config, tmp_path):
+    minimal_config["backends"]["nvidia"].update(
+        {"fallback_backend": "nvidia", "fallback_model": "m-nv2"}
+    )
+    minimal_config["researchers"] = [{"backend": "nvidia"}]
+    config = load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    fake = FakeLLM({"nv.test": [503, 503, 503, 503, "from m-nv2"]})
+    router = make(config, fake, tmp_path)
+    nvidia = router.backend("nvidia")
+    assert router.fallback_target(nvidia, "m-nv") == (nvidia, "m-nv2")
+    assert router.fallback_target(nvidia, "m-nv2") is None, "never the same pair twice"
+    assert router.configured_models()["nvidia"] == ["m-nv", "m-nv2"]
+    c = router.complete(MSGS, agent="a", tier="reason")
+    assert c.content == "from m-nv2" and c.backend == "nvidia"
+    calls = fake.calls("nv.test")
+    assert [x["model"] for x in calls] == ["m-nv"] * 4 + ["m-nv2"]
+    assert not fake.calls("local.test"), "the local model is not the fallback any more"
+    rows = router.ledger.list_llm_calls("r1")
+    assert [(r["model"], r["ok"], r["escalated"]) for r in rows] == [
+        ("m-nv", 0, 0),
+        ("m-nv2", 1, 1),
+    ]
+    # the primary model itself is the fallback model: no second hop, the error propagates
+    fake2 = FakeLLM({"nv.test": [503, 503, 503, 503]})
+    router2 = make(config, fake2, tmp_path)
+    with pytest.raises(LLMError, match="503"):
+        router2.complete(MSGS, agent="a", backend="nvidia", model="m-nv2")
+    assert len(fake2.calls("nv.test")) == 4

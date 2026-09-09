@@ -36,7 +36,7 @@ from aac.agents.researcher import (
     render_notes,
     run_researcher,
 )
-from aac.agents.scholar import research
+from aac.agents.scholar import research, reuse_packets
 from aac.agents.scout import Profile, profile_data
 from aac.agents.submitter import upload_submission, write_prediction_file
 from aac.agents.trainer import TrainResult, train_plan
@@ -50,7 +50,7 @@ from aac.llm.client import LLMError
 from aac.llm.router import Router
 from aac.models.cv import load_or_create_folds
 from aac.models.metrics import MetricSpec, resolve_metric
-from aac.plan import Plan, default_plan
+from aac.plan import BAGGABLE_FAMILIES, Plan, default_plan, variant_plan
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +77,7 @@ class BranchOutcome:
     training: TrainResult | None = None
     error: str | None = None
     duration: float = 0.0
+    seed: int | None = None
 
     @property
     def oof_score(self) -> float | None:
@@ -122,6 +123,39 @@ class RunSummary:
 
 
 @dataclass
+class _Seat:
+    """One Researcher's place in the schedule: its history so far and whether it goes on."""
+
+    index: int
+    spec: ResearcherSpec
+    history: list[Experiment] | None = None
+    max_rounds: int = 1
+    outcome: ResearcherOutcome | None = None
+    duration: float = 0.0
+    done: bool = False
+
+    @property
+    def next_round(self) -> int:
+        return (self.history[-1].round + 1) if self.history else 1
+
+    def wants(self, until_round: int | None) -> bool:
+        if self.done or self.next_round > self.max_rounds:
+            return False
+        return until_round is None or self.next_round <= until_round
+
+    def absorb(self, outcome: ResearcherOutcome | None) -> None:
+        if outcome is None:  # the budget stopped it
+            self.done = True
+            return
+        self.history = list(outcome.experiments)
+        self.duration += outcome.duration
+        outcome.duration = self.duration
+        self.outcome = outcome
+        if outcome.stopped_because:
+            self.done = True
+
+
+@dataclass
 class RunData:
     train: pd.DataFrame
     test: pd.DataFrame
@@ -155,25 +189,34 @@ def _prepare_sandbox_inputs(
     return train_path, test_path
 
 
-def run_default_branch(ctx: RunContext, data: RunData, *, dry_run: bool) -> BranchOutcome:
+def run_plan_branch(
+    ctx: RunContext,
+    data: RunData,
+    *,
+    name: str,
+    plan: Plan,
+    dry_run: bool = False,
+    seed: int | None = None,
+    families: list[str] | None = None,
+) -> BranchOutcome:
+    """Train one deterministic plan as a branch; every family becomes a pool member."""
     config = ctx.config
     started = time.monotonic()
-    name = DEFAULT_BRANCH_NAME
+    seed = config.run.seed if seed is None else seed
     branch_id = branch_ledger_id(ctx.run_id, name)
     branch_dir = ctx.paths.branch_dir(name)
     branch_dir.mkdir(parents=True, exist_ok=True)
-    plan = default_plan(list(config.models.enabled), data.profile.unusable_columns())
     atomic_write_json(branch_dir / "plan.json", plan.model_dump(mode="json"))
     ctx.ledger.create_branch(
         branch_id,
         ctx.run_id,
         backend="none",
-        model="default-plan",
+        model=f"{plan.name}-plan",
         plan=plan.model_dump(mode="json"),
         plan_hash=plan.hash(),
         status="training",
     )
-    outcome = BranchOutcome(name, branch_id, "planned", plan=plan)
+    outcome = BranchOutcome(name, branch_id, "planned", plan=plan, seed=seed)
     if dry_run:
         return outcome
     try:
@@ -185,13 +228,14 @@ def run_default_branch(ctx: RunContext, data: RunData, *, dry_run: bool) -> Bran
             data.y,
             data.folds,
             metric=data.metric,
-            seed=config.run.seed,
+            seed=seed,
             n_jobs=config.run.n_jobs,
             branch_dir=branch_dir,
             max_trees=config.run.max_trees,
+            families=families,
         )
     except Exception as exc:  # noqa: BLE001 - recorded, the run continues
-        log.exception("default branch failed")
+        log.exception("branch %s failed", name)
         outcome.status, outcome.error = "failed", f"{exc.__class__.__name__}: {exc}"[:500]
         ctx.ledger.update_branch(branch_id, status="failed", error=outcome.error)
         return outcome
@@ -210,27 +254,108 @@ def run_default_branch(ctx: RunContext, data: RunData, *, dry_run: bool) -> Bran
     return outcome
 
 
-def load_default_branch(ctx: RunContext, metric: MetricSpec) -> list[Member]:
-    """Members of a finished default branch from its artifacts (resume)."""
-    branch_dir = ctx.paths.branch_dir(DEFAULT_BRANCH_NAME)
-    metrics_path = branch_dir / "metrics.json"
-    if not metrics_path.exists():
+def run_default_branch(ctx: RunContext, data: RunData, *, dry_run: bool) -> BranchOutcome:
+    plan = default_plan(list(ctx.config.models.enabled), data.profile.unusable_columns())
+    return run_plan_branch(ctx, data, name=DEFAULT_BRANCH_NAME, plan=plan, dry_run=dry_run)
+
+
+def run_variant_branches(
+    ctx: RunContext, data: RunData, *, start_index: int
+) -> list[BranchOutcome]:
+    """The deterministic plan variants (README 17.2): levels as categoricals, target encoding."""
+    cfg = ctx.config.models
+    families = [f for f in cfg.variant_families if f in cfg.enabled]
+    outcomes: list[BranchOutcome] = []
+    for variant in cfg.variants:
+        plan = variant_plan(variant, data.profile, families, cfg.low_cardinality_max)
+        if plan is None:
+            log.info("variant %s: nothing to apply on this data; skipped", variant)
+            continue
+        name = f"b{start_index + len(outcomes):02d}-{plan.name}"
+        outcomes.append(run_plan_branch(ctx, data, name=name, plan=plan))
+    return outcomes
+
+
+def run_seed_bags(
+    ctx: RunContext, data: RunData, branches: list[BranchOutcome], *, start_index: int
+) -> list[BranchOutcome]:
+    """Retrain the best tree families with extra seeds: cheap, honest diversity for the pool."""
+    cfg = ctx.config.models
+    base_seed = ctx.config.run.seed
+    if cfg.seed_bag == 0:
         return []
-    metrics = json.loads(metrics_path.read_text())
-    members = []
-    for family, summary in metrics.get("models", {}).items():
-        oof_path, test_path = branch_dir / f"oof_{family}.npy", branch_dir / f"test_{family}.npy"
-        if oof_path.exists() and test_path.exists():
-            members.append(
-                Member(
-                    f"{DEFAULT_BRANCH_NAME}/{family}",
-                    np.load(oof_path),
-                    np.load(test_path),
-                    float(summary["oof_score"]),
-                    "branch",
-                )
+    direction = 1 if data.metric.greater_is_better else -1
+    scored: list[tuple[float, BranchOutcome, str]] = []
+    for b in branches:
+        if b.training is None or b.plan is None or b.seed != base_seed:
+            continue
+        for family, r in b.training.results.items():
+            if family in BAGGABLE_FAMILIES and r.duration <= cfg.seed_bag_max_seconds:
+                scored.append((r.oof_score * direction, b, family))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    by_branch: dict[str, tuple[BranchOutcome, list[str]]] = {}
+    for _, b, family in scored[: cfg.seed_bag_top]:
+        by_branch.setdefault(b.name, (b, []))[1].append(family)
+    if not by_branch:
+        log.info("seed bags: no family qualifies; skipped")
+        return []
+    outcomes: list[BranchOutcome] = []
+    for extra in range(1, cfg.seed_bag + 1):
+        seed = base_seed + extra
+        for b, families in by_branch.values():
+            assert b.plan is not None
+            name = f"b{start_index + len(outcomes):02d}-{b.plan.name}-s{seed}"
+            log.info("seed bag %s: %s of %s with seed %d", name, families, b.name, seed)
+            outcomes.append(
+                run_plan_branch(ctx, data, name=name, plan=b.plan, seed=seed, families=families)
             )
+    return outcomes
+
+
+def train_branches(ctx: RunContext, data: RunData, summary: RunSummary) -> None:
+    """Default plan, its variants, then seed bags of the best tree families."""
+    t = time.monotonic()
+    summary.branches.append(run_default_branch(ctx, data, dry_run=False))
+    _stage("default", t)
+    t = time.monotonic()
+    variants = run_variant_branches(ctx, data, start_index=len(summary.branches))
+    summary.branches.extend(variants)
+    if variants:
+        _stage("variants", t)
+    t = time.monotonic()
+    bags = run_seed_bags(ctx, data, summary.branches, start_index=len(summary.branches))
+    summary.branches.extend(bags)
+    if bags:
+        _stage("seed bags", t)
+
+
+def load_branches(ctx: RunContext, metric: MetricSpec) -> list[Member]:
+    """Members of every finished branch from its artifacts (resume)."""
+    members: list[Member] = []
+    if not ctx.paths.branches_dir.is_dir():
+        return members
+    for branch_dir in sorted(ctx.paths.branches_dir.iterdir()):
+        metrics_path = branch_dir / "metrics.json"
+        if not metrics_path.exists():
+            continue
+        metrics = json.loads(metrics_path.read_text())
+        for family, summary in metrics.get("models", {}).items():
+            oof_path = branch_dir / f"oof_{family}.npy"
+            test_path = branch_dir / f"test_{family}.npy"
+            if oof_path.exists() and test_path.exists():
+                members.append(
+                    Member(
+                        f"{branch_dir.name}/{family}",
+                        np.load(oof_path),
+                        np.load(test_path),
+                        float(summary["oof_score"]),
+                        "branch",
+                    )
+                )
     return members
+
+
+load_default_branch = load_branches
 
 
 def candidates(
@@ -424,6 +549,10 @@ def _research_and_submit(
             record_pitfalls(ctx.ledger, config.competition.slug, ctx.run_id, tracks)
         scholar = config.scholar_spec()
         if scholar is not None and not ctx.ledger.list_notes(ctx.run_id, kind="research"):
+            reuse_packets(
+                ctx.ledger, config.competition.slug, ctx.run_id, max_age=scholar.reuse_runs
+            )
+        if scholar is not None and not ctx.ledger.list_notes(ctx.run_id, kind="research"):
             try:
                 ctx.budget.check()
                 research(
@@ -443,14 +572,14 @@ def _research_and_submit(
         t = time.monotonic()
         budget_hit: list[BudgetExceeded] = []
 
-        def worker(index: int, spec: ResearcherSpec) -> ResearcherOutcome | None:
-            agent = f"r{index:02d}-{spec.track}-{spec.backend}"
+        def worker(seat: _Seat, until_round: int | None) -> ResearcherOutcome | None:
+            spec = seat.spec
             try:
                 return run_researcher(
                     ctx,
                     router,
                     spec=spec,
-                    index=index,
+                    index=seat.index,
                     profile=profile,
                     metric=metric,
                     y=y,
@@ -464,21 +593,42 @@ def _research_and_submit(
                     ),
                     team=team,
                     slices=slices,
-                    history=(histories or {}).get(agent),
+                    history=seat.history,
+                    until_round=until_round,
                 )
             except BudgetExceeded as exc:
                 budget_hit.append(exc)
                 return None
 
+        seats = [
+            _Seat(i, spec, (histories or {}).get(f"r{i:02d}-{spec.track}-{spec.backend}"))
+            for i, spec in enumerate(researchers, start=1)
+        ]
+        for seat in seats:
+            seat.max_rounds = seat.spec.rounds or config.run.max_rounds
+        # Round-robin: every seat plays round n before any seat plays round n+1, so a slow or
+        # failing seat cannot starve the others of the wall clock. Sequential: one pass.
+        passes: list[int | None] = (
+            [None]
+            if config.run.schedule == "sequential"
+            else list(range(1, max(s.max_rounds for s in seats) + 1))
+        )
         workers = max(1, min(config.run.parallel_branches, len(researchers)))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="researcher") as pool_exec:
-            futures = [
-                pool_exec.submit(worker, i, spec) for i, spec in enumerate(researchers, start=1)
-            ]
-            for future in futures:
-                outcome = future.result()
-                if outcome is not None:
-                    summary.researchers.append(outcome)
+            for until in passes:
+                if budget_hit:
+                    break
+                active = [s for s in seats if s.wants(until)]
+                if not active:
+                    # nobody plays this round (resumed seats are past it); stop only when no
+                    # seat can play any later round either
+                    if all(s.done or s.next_round > s.max_rounds for s in seats):
+                        break
+                    continue
+                futures = [(s, pool_exec.submit(worker, s, until)) for s in active]
+                for seat, future in futures:
+                    seat.absorb(future.result())
+        summary.researchers.extend(s.outcome for s in seats if s.outcome is not None)
         if budget_hit:
             # The budget stops new work, never the submission of what was earned.
             log.warning("stopping new work: %s", budget_hit[0])
@@ -602,14 +752,15 @@ def run(
             if config.researcher_specs():
                 _verify_backends(router)
 
-            t = time.monotonic()
-            summary.branches.append(run_default_branch(ctx, data, dry_run=dry_run))
-            _stage("default", t)
             if dry_run:
+                t = time.monotonic()
+                summary.branches.append(run_default_branch(ctx, data, dry_run=True))
+                _stage("default", t)
                 ctx.finish("completed")
                 summary.status = "completed"
                 _print_summary(console, summary, metric_key)
                 return summary
+            train_branches(ctx, data, summary)
 
             seed_members = [
                 Member(c.name, c.oof, c.test_pred, c.oof_score, c.origin)
@@ -696,17 +847,15 @@ def resume(
             if config.researcher_specs():
                 _verify_backends(router)
 
-            seed_members = load_default_branch(ctx, data.metric)
+            seed_members = load_branches(ctx, data.metric)
             if not seed_members:
-                t = time.monotonic()
-                summary.branches.append(run_default_branch(ctx, data, dry_run=False))
-                _stage("default", t)
+                train_branches(ctx, data, summary)
                 seed_members = [
                     Member(c.name, c.oof, c.test_pred, c.oof_score, c.origin)
                     for c in candidates(summary.branches, [])
                 ]
             else:
-                log.info("resume: default branch reloaded (%d families)", len(seed_members))
+                log.info("resume: %d branch members reloaded", len(seed_members))
 
             histories: dict[str, list[Experiment]] = {}
             for agent in {r["agent"] for r in ledger.list_experiments(run_id)}:

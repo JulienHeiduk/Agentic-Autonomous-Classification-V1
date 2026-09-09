@@ -92,8 +92,15 @@ def test_shipped_s6e9_config_loads():
     assert set(c.backends) == {"local", "nvidia"}
     researchers = c.researcher_specs()
     assert len(researchers) >= 3
-    assert len({r.backend for r in researchers}) >= 2, "README section 13: at least 2 backends"
     assert len({r.track for r in researchers}) >= 3
+    # 2026-09-08: the local seat was retired (1 working round in 20); the second backend
+    # stays configured and verified, and hub failures fall over to another hub model.
+    nvidia = c.backends["nvidia"]
+    assert nvidia.fallback_backend == "nvidia" and nvidia.fallback_model
+    assert nvidia.trip_after == 2 and c.sandbox.experiment_timeout_seconds == 900
+    assert c.models.variants == ["categorical", "encoded"] and c.models.seed_bag == 2
+    assert c.scholar is not None and c.scholar.reuse_runs == 3
+    assert c.run.schedule == "round_robin"
     assert c.router.reason == "nvidia"
     assert c.competition.metric is None, "metric must come from the Kaggle API by default"
 
@@ -125,4 +132,21 @@ def test_researchers_config(write_config, minimal_config):
     ]
     minimal_config["researchers"] = [{"backend": "ghost"}]
     with pytest.raises(ConfigError, match="researchers\\[0\\]"):
+        load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+
+
+def test_fallback_pair_validation(write_config, minimal_config):
+    minimal_config["backends"]["nvidia"]["fallback_backend"] = "ghost"
+    with pytest.raises(ConfigError, match="fallback_backend"):
+        load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    minimal_config["backends"]["nvidia"].pop("fallback_backend")
+    minimal_config["backends"]["nvidia"]["fallback_model"] = "m-nv2"
+    with pytest.raises(ConfigError, match="needs fallback_backend"):
+        load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    minimal_config["backends"]["nvidia"]["fallback_backend"] = "nvidia"
+    c = load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    assert c.backends["nvidia"].fallback_model == "m-nv2"
+    assert c.backends["nvidia"].trip_after == 2 and c.backends["nvidia"].cooldown_seconds == 600
+    minimal_config["models"] = {"variants": ["encoded", "encoded"]}
+    with pytest.raises(ConfigError, match="duplicates"):
         load_config(write_config(minimal_config), env={"NV_KEY": "k"})

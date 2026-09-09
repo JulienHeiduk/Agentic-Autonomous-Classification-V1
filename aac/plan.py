@@ -142,6 +142,66 @@ class Plan(StrictModel):
         return hashlib.sha256(self.canonical().encode()).hexdigest()[:16]
 
 
+BAGGABLE_FAMILIES = frozenset({"lightgbm", "xgboost", "catboost", "hist_gbdt"})
+
+
+def low_cardinality_numeric(profile: Any, max_unique: int) -> list[str]:
+    """Usable numeric columns with few distinct values: integers that are really levels."""
+    return [
+        c.name
+        for c in profile.columns
+        if c.usable
+        and c.kind == "numeric"
+        and c.name != profile.id_col
+        and 2 <= c.n_unique <= max_unique
+    ]
+
+
+def variant_plan(
+    variant: str, profile: Any, families: list[str], low_cardinality_max: int
+) -> Plan | None:
+    """A deterministic plan variant, or None when the data gives it nothing to work on.
+
+    ``categorical``: the low-cardinality integers join the categoricals for native handling.
+    ``encoded``: categoricals and those integers are target-encoded inside each fold; the
+    integers also stay as numbers.
+    """
+    if not families:
+        return None
+    levels = low_cardinality_numeric(profile, low_cardinality_max)
+    cats = [c.name for c in profile.columns if c.usable and c.kind in ("categorical", "boolean")]
+    drops = sorted(profile.unusable_columns())
+    models = [ModelConfig(family=f) for f in families]
+    if variant == "categorical":
+        if not levels:
+            return None
+        return Plan(
+            name="categorical",
+            rationale=(
+                f"Low-cardinality integer columns {levels} handled as categorical levels "
+                "next to the true categoricals; otherwise the default plan."
+            ),
+            drop_columns=drops,
+            categorical_columns=cats + levels,
+            models=models,
+        )
+    if variant == "encoded":
+        columns = cats + levels
+        if not columns:
+            return None
+        return Plan(
+            name="encoded",
+            rationale=(
+                f"Fold-internal target encoding of {columns}; integers keep their numeric "
+                "column as well; otherwise the default plan."
+            ),
+            drop_columns=drops,
+            target_encode=columns,
+            models=models,
+        )
+    raise ValueError(f"unknown plan variant {variant!r}")
+
+
 def default_plan(families: list[str], drop_columns: list[str]) -> Plan:
     return Plan(
         name="default",

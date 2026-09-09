@@ -22,6 +22,7 @@ the README, and note findings that change later work.
 | 11 | Phase 4: Assessor interviews, track record, Historian, resume | done | 2026-09-06 |
 | 12 | Hardening and unattended runs | done | 2026-09-06 |
 | 13 | Track-safe knowledge, pitfalls memory, degenerate check | done | 2026-09-08 |
+| 14 | Deterministic levers, hub resilience, round-robin seats, packet reuse | done | 2026-09-08 |
 
 ## Done
 
@@ -454,6 +455,55 @@ predicted a constant (AUC 0.5000) and was counted as ok.
 local model passes its interview); revisit after a run with the fixes above. `run.max_trees`
 never applied to Researcher modules, so it is not the envelope constraint; the 1800 s
 timeout with three seeds times five folds on 668k rows is.
+
+### 14. Deterministic levers, hub resilience, round-robin seats, packet reuse (2026-09-08)
+
+Run 20260908-1609, the first with milestone 13, finished at OOF 0.941995 / public 0.94177,
+the same plateau as the two runs before it (0.942008 / 0.94178 and 0.942000 / 0.94174). The
+stack over the five default families alone was 0.94196 at minute nine; the ten-member stack
+at minute 142 was 0.941995: two hours of Researchers bought 0.00004. Track violations fell
+from six to one, no degenerate round occurred, but the open seat spent 77 minutes on four
+failed rounds (38 of them on twelve timed-out hub attempts in round one, then yesterday's
+target-encoding IndexError again), and the local linear seat went 0/4 on code quality.
+
+- **Deterministic plan variants** (`models.variants`, `variant_families`,
+  `low_cardinality_max`): `b01-categorical` treats low-cardinality integers as categorical
+  levels; `b02-encoded` target-encodes categoricals and those integers inside each fold, the
+  integers keeping their numeric column (`_target_encode` no longer drops numeric originals).
+  On S6E9 that is Age, Number_of_Cars_Owned, both charging-station counts and
+  Environmental_Concern_Level. lightgbm and xgboost only: about 45 s each.
+- **Seed bags** (`models.seed_bag`, `seed_bag_top`, `seed_bag_max_seconds`): the two best
+  tree families under 120 s are retrained with seeds 43 and 44; every replica is a pool
+  member. `run_plan_branch` generalises the default branch; `load_branches` reloads every
+  branch on resume.
+- **Router**: `fallback_backend` / `fallback_model` per backend (S6E9: hub failures go to
+  nemotron-super on the hub, never to qwen, which produced no module in three fallover
+  rounds); a circuit breaker (`trip_after` 2, `cooldown_seconds` 600) skips a backend after
+  two consecutive failed calls instead of spending four attempts per call. Fallback models
+  are verified at startup. Non-retryable errors never trip it.
+- **Round-robin seats** (`run.schedule`): `run_researcher` runs up to `until_round` and
+  rebuilds its patience and failure counters from history (`history_counters`); the
+  orchestrator interleaves seats so every seat plays round n before any plays n+1. Each
+  prompt carries the minutes of wall clock left (prompt v6). `experiment_timeout_seconds`
+  is 900 on S6E9.
+- **Remedies in the environment card**: positional alignment of `y_train` (the IndexError
+  seen three runs running), category arithmetic, the HistGradientBoosting and scheduler
+  keyword slips, focal-loss gamma, the fit_predict signature and column references. The
+  pitfalls note now quotes the offending source line next to the exception.
+- **Scholar packet reuse** (`scholar.reuse_runs`, ledger schema v6 `notes.origin_run`): the
+  latest packets on the slug are copied into a run when they are under three runs old.
+  Half of today's 24 ideas were near-duplicates of yesterday's, at 14 minutes of hub time.
+- **S6E9 config**: the local qwen linear seat is retired (1 working round in 20 over five
+  runs; interviews cannot see it because the interview module is trivial). README section
+  13 item 3 amended: the second backend stays configured and verified as the fallback.
+- Tests: breaker and fallback pair, config validation, variant plans and family filter,
+  stepping and counters, offending line, note origins, packet reuse across runs, seven
+  branches end to end, round-robin versus sequential order.
+
+**Expected effect on S6E9:** the encoded and categorical variants answer, at no LLM cost,
+whether target encoding and level handling move the third decimal. If they do not, the
+remaining gap to 0.9467 is the original dataset, and the Researcher layer is the wrong place
+to look.
 
 ## Reference write-up: gap analysis (2026-09-06)
 

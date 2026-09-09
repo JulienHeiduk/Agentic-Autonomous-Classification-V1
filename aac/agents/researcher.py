@@ -285,6 +285,18 @@ API_NOTES = [
     "(use .to_numpy() or column selection).",
     "pandas 3: string columns have dtype 'str'; use .astype(str) before .str methods; "
     "boolean-like object columns hold True/False/None: use .map({True: 1, False: 0}).",
+    "y_train is aligned with X_train by POSITION, not by label: never index it with a frame's "
+    ".index or a groupby's group index (IndexError: index N is out of bounds). For target "
+    "encoding use pd.Series(y_train, index=X_train.index) and groupby on that, or "
+    "X_train.reset_index(drop=True) with positional masks.",
+    "category columns have no arithmetic (Categorical * Categorical raises): use "
+    ".cat.codes or .astype(str) first, or build interactions in build_features on the raw "
+    "frames.",
+    "HistGradientBoostingClassifier has no n_jobs; torch ReduceLROnPlateau has no verbose; "
+    "focal loss is (1 - p) ** gamma with gamma a float, a Tensor has no .gamma.",
+    "fit_predict takes exactly five positional arguments (X_train, y_train, X_valid, X_test, "
+    "meta) and returns (p_valid, p_test). Inside it reference only columns in "
+    "meta['features']; build_features must not drop or rename input columns.",
 ]
 
 
@@ -426,10 +438,12 @@ def researcher_messages(
     notes: str = "",
     ensemble_text: str = "",
     analysis: str = "",
+    budget: str = "",
 ) -> list[dict[str, str]]:
     t = profile.target
     last = experiments[-1] if experiments else None
     return load_prompt("researcher").messages(
+        budget=budget or "(not tracked)",
         allowed_imports=", ".join(sorted(EXPERIMENT_IMPORTS)),
         timeout=int(timeout),
         n_train=profile.n_train,
@@ -533,8 +547,13 @@ def run_researcher(
     team: TeamState | None = None,
     slices: pd.DataFrame | None = None,
     history: list[Experiment] | None = None,
+    until_round: int | None = None,
 ) -> ResearcherOutcome:
-    """The loop for one Researcher. Failures are recorded; BudgetExceeded propagates."""
+    """The loop for one Researcher. Failures are recorded; BudgetExceeded propagates.
+
+    ``history`` continues an agent (resume, or the scheduler's previous pass) and
+    ``until_round`` stops after that round so the scheduler can interleave seats; the
+    patience and failure counters are rebuilt from the history."""
     config = ctx.config
     started = time.monotonic()
     agent = f"r{index:02d}-{spec.track}-{spec.backend}"
@@ -553,18 +572,24 @@ def run_researcher(
             if team is not None:
                 team.update(outcome.best)
         first_round = history[-1].round + 1
+        since_improvement, consecutive_failures = history_counters(
+            history, metric, config.run.min_improvement
+        )
+    last_round = max_rounds if until_round is None else min(until_round, max_rounds)
     n_classes = len(profile.target.classes)
     timeout = config.sandbox.experiment_timeout_seconds
     log.info(
-        "%s: %s/%s on track %s for up to %d rounds",
+        "%s: %s/%s on track %s, rounds %d to %d of %d",
         agent,
         spec.backend,
         spec.model,
         spec.track,
+        first_round,
+        last_round,
         max_rounds,
     )
 
-    for round_no in range(first_round, max_rounds + 1):
+    for round_no in range(first_round, last_round + 1):
         try:
             ctx.budget.check()
         except BudgetExceeded as exc:
@@ -590,6 +615,7 @@ def run_researcher(
             notes=notes() if notes else "",
             ensemble_text=pool.leaderboard() if pool else "",
             analysis=_last_analysis(outcome.experiments),
+            budget=budget_text(ctx.budget.remaining_seconds, timeout),
         )
         hypothesis, code, raw, backend, model = propose(
             router, messages, spec=spec, agent=agent, branch_id=exp_id
@@ -760,7 +786,7 @@ def run_researcher(
             outcome.stopped_because = f"no improvement for {since_improvement} rounds"
             break
     else:
-        outcome.stopped_because = "rounds exhausted"
+        outcome.stopped_because = "rounds exhausted" if last_round >= max_rounds else ""
     outcome.duration = time.monotonic() - started
     log.info(
         "%s done: %d/%d experiments ok, best %s, %s",
@@ -771,6 +797,42 @@ def run_researcher(
         outcome.stopped_because,
     )
     return outcome
+
+
+def budget_text(remaining_seconds: float, experiment_timeout: float) -> str:
+    """The wall clock left for the whole team, so late rounds pick affordable models."""
+    return (
+        f"{remaining_seconds / 60:.0f} minutes of wall clock remain for every seat's remaining "
+        f"rounds; an experiment that hits the {experiment_timeout / 60:.0f}-minute limit "
+        "costs all of it for nothing."
+    )
+
+
+def history_counters(
+    experiments: list[Experiment], metric: MetricSpec, min_improvement: float
+) -> tuple[int, int]:
+    """(rounds since the last improvement, consecutive failures) as the loop would have
+    counted them: an experiment improves when it beats the last improving score by more than
+    ``min_improvement`` or raised the ensemble by more than that."""
+    since = failures = 0
+    best: float | None = None
+    for e in experiments:
+        if not e.ok:
+            failures += 1
+            since += 1
+            continue
+        failures = 0
+        improved = (
+            best is None
+            or metric.improvement(e.oof_score, best) > min_improvement
+            or (e.pool_gain is not None and e.pool_gain > min_improvement)
+        )
+        if improved:
+            best = e.oof_score
+            since = 0
+        else:
+            since += 1
+    return since, failures
 
 
 def _team_block(

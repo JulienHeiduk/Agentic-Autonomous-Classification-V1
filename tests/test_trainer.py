@@ -130,3 +130,55 @@ def test_one_failing_family_does_not_sink_the_branch(setup, tmp_path):
             n_jobs=2,
             branch_dir=tmp_path,
         )
+
+
+def test_variant_plans_from_the_profile(setup, tmp_path):
+    from aac.plan import low_cardinality_numeric, variant_plan
+
+    train, test, _, profile, y, folds = setup
+    assert low_cardinality_numeric(profile, 50) == ["x3"], "x3 holds five integer levels"
+    cat = variant_plan("categorical", profile, ["lightgbm"], 50)
+    assert cat.name == "categorical" and cat.categorical_columns == ["cat", "flag", "x3"]
+    assert cat.target_encode == [] and [m.family for m in cat.models] == ["lightgbm"]
+    enc = variant_plan("encoded", profile, ["lightgbm", "xgboost"], 50)
+    assert enc.name == "encoded" and enc.target_encode == ["cat", "flag", "x3"]
+    assert enc.categorical_columns is None
+    assert variant_plan("categorical", profile, ["lightgbm"], 3) is None, "x3 has 5 values"
+    assert variant_plan("encoded", profile, [], 50) is None
+    with pytest.raises(ValueError, match="unknown plan variant"):
+        variant_plan("ghost", profile, ["lightgbm"], 50)
+
+    features, categorical = select_features(cat, profile, train, test)
+    assert "x3" in categorical and "cat" in categorical
+    result = train_plan(
+        enc,
+        profile,
+        train,
+        test,
+        y,
+        folds,
+        metric=METRICS["auc"],
+        seed=1,
+        n_jobs=2,
+        branch_dir=tmp_path / "enc",
+        families=["lightgbm"],
+    )
+    assert set(result.results) == {"lightgbm"}, "the family filter drops xgboost"
+    assert result.results["lightgbm"].oof_score > 0.8
+    imp = result.results["lightgbm"].importances
+    assert "x3" in imp and "x3__te" in imp, "an integer keeps its column beside its encoding"
+    assert "cat" not in imp and "cat__te" in imp, "a category is replaced by its encoding"
+    with pytest.raises(ValueError, match="none of the families"):
+        train_plan(
+            enc,
+            profile,
+            train,
+            test,
+            y,
+            folds,
+            metric=METRICS["auc"],
+            seed=1,
+            n_jobs=2,
+            branch_dir=tmp_path / "none",
+            families=["catboost"],
+        )

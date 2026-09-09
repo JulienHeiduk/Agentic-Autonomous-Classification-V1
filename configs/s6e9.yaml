@@ -21,6 +21,15 @@ models:
   enabled: [lightgbm, xgboost, catboost, hist_gbdt, logistic]
   tuning: optuna
   tuning_trials: 30
+  # Deterministic variants after the default plan (README 17.2): low-cardinality integers as
+  # categorical levels, and fold-internal target encoding. Fast families only.
+  variants: [categorical, encoded]
+  variant_families: [lightgbm, xgboost]
+  low_cardinality_max: 50
+  # Seed bags of the two best fast tree families: honest diversity the stacker can use.
+  seed_bag: 2
+  seed_bag_top: 2
+  seed_bag_max_seconds: 120     # catboost (396 s here) is never bagged
 
 kaggle:
   submit: true
@@ -28,7 +37,7 @@ kaggle:
 
 sandbox:
   timeout_seconds: 900
-  experiment_timeout_seconds: 1800
+  experiment_timeout_seconds: 900   # a timed-out round cost 30 of 180 minutes at 1800
   memory_mb: 8192
 
 backends:
@@ -46,6 +55,13 @@ backends:
     cost_per_1k: 0.0
     timeout: 180               # per attempt; longest good module reply seen 144s (gpt-oss, 2026-09-06)
     max_concurrency: 4
+    # Failed hub calls fall over to nemotron-super on the same hub, never to the local model:
+    # qwen produced no module in any fallover round (2026-09-08). Two failed calls in a row
+    # skip the hub for ten minutes instead of retrying it four times per call.
+    fallback_backend: nvidia
+    fallback_model: nvidia/nemotron-3-super-120b-a12b
+    trip_after: 2
+    cooldown_seconds: 600
 
 # Task tier -> backend (README section 5.3).
 router:
@@ -55,11 +71,12 @@ router:
 
 # V2 (README section 17): one Researcher per (backend, model, track). Each writes fit_predict
 # experiments run by the fold-owning harness; tracks compete and share (M8).
+# The local qwen linear seat was retired on 2026-09-08: 1 working round in 20 on this table.
+# Seats run round-robin (run.schedule) so no seat starves the others of the wall clock.
 researchers:
   - { backend: nvidia, model: nvidia/nemotron-3-super-120b-a12b, track: gbdt, temperature: 0.3 }
   - { backend: nvidia, model: nvidia/nemotron-3-super-120b-a12b, track: neural, temperature: 0.6 }
   - { backend: nvidia, model: nvidia/nemotron-3-ultra-550b-a55b, track: open, temperature: 0.5 }
-  - { backend: local, model: qwen2.5-coder:14b-instruct, track: linear, temperature: 0.4 }
 
 # Research packets (README 17.2, the article's phase 3): ideas only, from the strongest slow model.
 scholar:
@@ -67,3 +84,4 @@ scholar:
   model: nvidia/nemotron-3-ultra-550b-a55b
   temperature: 0.7
   max_ideas: 8
+  reuse_runs: 3                # packets describe the competition: reuse them for 3 later runs

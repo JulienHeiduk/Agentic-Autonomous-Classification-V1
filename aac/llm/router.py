@@ -34,6 +34,7 @@ class Router:
         run_id: str | None = None,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self.backends: dict[str, Backend] = {
@@ -49,6 +50,12 @@ class Router:
         self.run_id = run_id
         self._client = client or httpx.Client()
         self._sleep = sleep
+        self._clock = clock
+        # Circuit breaker state per backend: consecutive failed calls, and until when it is
+        # skipped in favour of its fallback.
+        self._failures: dict[str, int] = dict.fromkeys(self.backends, 0)
+        self._down_until: dict[str, float] = dict.fromkeys(self.backends, 0.0)
+        self._breaker_lock = threading.Lock()
 
     # -- selection --------------------------------------------------------------------------
 
@@ -74,6 +81,44 @@ class Router:
                 return self.backends[other]
         return None
 
+    def fallback_target(self, backend: Backend, model: str) -> tuple[Backend, str] | None:
+        """Where a failed call goes: the configured fallback backend and model, else the other
+        backend with its default model. None when that would be the same pair again."""
+        cfg = self.config.backends[backend.name]
+        if cfg.fallback_backend is None:
+            other = self.fallback(backend.name)
+            return (other, other.model) if other is not None else None
+        target = self.backend(cfg.fallback_backend)
+        target_model = cfg.fallback_model or target.model
+        if target.name == backend.name and target_model == model:
+            return None
+        return target, target_model
+
+    def is_down(self, name: str) -> bool:
+        with self._breaker_lock:
+            return self._clock() < self._down_until[name]
+
+    def _note_failure(self, backend: Backend, exc: LLMError) -> None:
+        if not exc.retryable:  # a 404 or a malformed body is not overload
+            return
+        cfg = self.config.backends[backend.name]
+        with self._breaker_lock:
+            self._failures[backend.name] += 1
+            if self._failures[backend.name] < cfg.trip_after or cfg.cooldown_seconds <= 0:
+                return
+            self._failures[backend.name] = 0
+            self._down_until[backend.name] = self._clock() + cfg.cooldown_seconds
+        log.warning(
+            "%s: %d consecutive failed calls; skipping it for %.0fs",
+            backend.name,
+            cfg.trip_after,
+            cfg.cooldown_seconds,
+        )
+
+    def _note_success(self, name: str) -> None:
+        with self._breaker_lock:
+            self._failures[name] = 0
+
     def configured_models(self) -> dict[str, list[str]]:
         wanted: dict[str, list[str]] = {name: [b.model] for name, b in self.backends.items()}
         scholar = self.config.scholar_spec()
@@ -83,6 +128,10 @@ class Router:
         for spec in specs:
             if spec.model and spec.model not in wanted[spec.backend]:
                 wanted[spec.backend].append(spec.model)
+        for cfg in self.config.backends.values():
+            fb, fm = cfg.fallback_backend, cfg.fallback_model
+            if fb and fm and fm not in wanted[fb]:
+                wanted[fb].append(fm)
         return wanted
 
     def verify_models(self) -> dict[str, list[str]]:
@@ -152,17 +201,23 @@ class Router:
     ) -> Completion:
         """Complete on the tier's backend (or an explicit one); fall over once on failure."""
         primary = self.backend(backend) if backend else self.for_tier(tier)
-        chain: list[tuple[Backend, str | None, bool]] = [(primary, model, escalated)]
-        fallback = self.fallback(primary.name) if allow_failover else None
+        primary_model = model or primary.model
+        chain: list[tuple[Backend, str, bool]] = [(primary, primary_model, escalated)]
+        fallback = self.fallback_target(primary, primary_model) if allow_failover else None
         if fallback is not None:
-            chain.append((fallback, None, True))
+            chain.append((fallback[0], fallback[1], True))
 
         last_error: LLMError | None = None
-        for target, target_model, hop_escalated in chain:
+        for hop, (target, resolved_model, hop_escalated) in enumerate(chain):
             if self.budget is not None:
                 self.budget.check()
-            resolved_model = target_model or target.model
-            if hop_escalated and target is not primary:
+            if hop < len(chain) - 1 and self.is_down(target.name):
+                last_error = LLMError(
+                    f"{target.name} is cooling down after repeated failures", kind="transport"
+                )
+                log.warning("%s: %s; trying the fallback first", agent, last_error)
+                continue
+            if hop > 0:
                 log.warning(
                     "%s: %s failed (%s); falling over to %s/%s",
                     agent,
@@ -186,6 +241,7 @@ class Router:
                     )
                 except LLMError as exc:
                     last_error = exc
+                    self._note_failure(target, exc)
                     self._record(
                         agent=agent,
                         tier=tier,
@@ -198,6 +254,7 @@ class Router:
                         escalated=hop_escalated,
                     )
                     continue
+            self._note_success(target.name)
             self._record(
                 agent=agent,
                 tier=tier,

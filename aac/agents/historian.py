@@ -120,6 +120,18 @@ def error_tail(error: str | None, width: int = 220) -> str:
     return tail[:width]
 
 
+def offending_line(error: str | None) -> str:
+    """The source line a traceback points at (the line above the caret art), if any."""
+    lines = [ln.rstrip() for ln in (error or "").splitlines()]
+    for i in range(len(lines) - 1, 0, -1):
+        if re.match(r"^\s*[\^~]+\s*$", lines[i]):
+            return re.sub(r"\s+", " ", lines[i - 1].strip())[:120]
+    for i in range(len(lines) - 2, -1, -1):
+        if lines[i].lstrip().startswith('File "') and lines[i + 1].strip():
+            return re.sub(r"\s+", " ", lines[i + 1].strip())[:120]
+    return ""
+
+
 def pitfalls(
     ledger: Ledger,
     slug: str,
@@ -164,6 +176,9 @@ def pitfalls(
         n = counts[tail]
         hyp = str(r.get("hypothesis") or "").strip()
         hint = f" (hypothesis: {hyp[:80]})" if hyp and r.get("kind") == "timeout" else ""
+        code = offending_line(r.get("error"))  # type: ignore[arg-type]
+        if code and r.get("kind") == "error":
+            hint += f" [code: {code}]"
         lines.append(
             f"- [{r.get('kind')}, {n}x, last {r.get('run_id')} on {r.get('track') or '?'}] "
             f"{tail}{hint}"

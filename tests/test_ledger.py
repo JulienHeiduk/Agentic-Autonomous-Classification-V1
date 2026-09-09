@@ -228,6 +228,18 @@ def test_experiments_and_notes(ledger):
     ]
     assert [e["id"] for e in ledger.best_experiments("slug")] == ["r1-b-r1", "r1-a-r1"]
     assert [e["id"] for e in ledger.best_experiments("slug", track="gbdt")] == ["r1-a-r1"]
+    # the latest notes of a kind on the slug, and how many runs came after their origin
+    ledger._conn.execute("UPDATE runs SET started_at = '2026-01-01T00:00:00+00:00' WHERE id='r1'")
+    ledger._conn.execute("UPDATE runs SET started_at = '2026-01-02T00:00:00+00:00' WHERE id='r2'")
+    ledger._conn.commit()
+    assert [n["text"] for n in ledger.latest_notes("slug", "research")] == ["try ratios"]
+    assert ledger.latest_notes("slug", "research", exclude_run="r1") == []
+    ledger.add_note(source="scholar", kind="research", text="copy", run_id="r2", origin_run="r1")
+    [copy] = ledger.latest_notes("slug", "research")
+    assert copy["origin_run"] == "r1" and copy["run_id"] == "r2"
+    assert ledger.runs_since("slug", "r1") == 1 and ledger.runs_since("slug", "r2") == 0
+    assert ledger.runs_since("slug", "r1", exclude_run="r2") == 0
+    assert ledger.runs_since("slug", "gone") >= 10**6
 
 
 def test_migrates_a_v4_ledger_notes_table(tmp_path):
@@ -252,3 +264,6 @@ def test_migrates_a_v4_ledger_notes_table(tmp_path):
         assert old["track"] is None and old["text"] == "old packet"
         ledger.add_note(source="historian", kind="prior", text="p", run_id="r0", track="linear")
         assert [n["track"] for n in ledger.list_notes("r0", track="linear")] == [None, "linear"]
+        assert old["origin_run"] is None
+        ledger.add_note(source="scholar", kind="research", text="c", run_id="r0", origin_run="x")
+        assert ledger.list_notes("r0", kind="research")[-1]["origin_run"] == "x"

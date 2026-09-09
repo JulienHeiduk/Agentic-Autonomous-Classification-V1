@@ -372,10 +372,13 @@ These protect the run from itself:
 
 ## 11. Config
 
-*V1 keys. V2 adds `researchers`, `scholar`, `assessor`, `run.max_rounds`,
-`run.max_consecutive_failures`, `run.share_every`, `run.degenerate_margin`,
-`sandbox.experiment_timeout_seconds`, `sandbox.determinism_rows`, and drops `architect` and
-`run.n_branches`; see `configs/`.*
+*V1 keys. V2 adds `researchers`, `scholar` (with `reuse_runs`), `assessor`,
+`run.max_rounds`, `run.max_consecutive_failures`, `run.share_every`, `run.degenerate_margin`,
+`run.schedule`, `models.variants`, `models.variant_families`, `models.low_cardinality_max`,
+`models.seed_bag`, `models.seed_bag_top`, `models.seed_bag_max_seconds`,
+`backends.*.fallback_backend`, `backends.*.fallback_model`, `backends.*.trip_after`,
+`backends.*.cooldown_seconds`, `sandbox.experiment_timeout_seconds`,
+`sandbox.determinism_rows`, and drops `architect` and `run.n_branches`; see `configs/`.*
 
 ```yaml
 competition:
@@ -439,7 +442,9 @@ does all of the following unattended:
 1. Authenticates to Kaggle, pulls S6E9 metadata and data, reads the evaluation metric from the
    API.
 2. Profiles the data and infers target and ID columns without them being configured.
-3. Produces at least 3 divergent plans from at least 2 different LLM backends.
+3. Produces at least 3 divergent plans from at least 2 different LLM backends. *(V2, amended
+   2026-09-08: at least 3 Researcher seats on distinct tracks; the second backend stays
+   configured and verified as a fallback, a seat on it is optional after its track record.)*
 4. Generates feature code that executes cleanly, or recovers from a traceback within the retry
    budget.
 5. Trains at least 3 model families with a shared fold assignment and produces valid OOF.
@@ -568,16 +573,27 @@ Per-experiment wall-clock and memory limits come from config.
   `share_every` rounds the trailing agent's prompt receives the leader's experiment and
   notes. This is the write-up's tip sharing. A leader module that imports a library the
   receiver's track forbids is shared as its hypothesis only, never as code.
+- **Schedule**: seats play round-robin (`run.schedule`): every seat gets round n before any
+  seat gets round n+1, so a slow or failing seat cannot starve the others of the wall clock.
+  Each prompt carries the minutes left for the whole team.
 - **Scholar** (LLM, research packets): the strongest slow hub model, asked for feature and
   modelling ideas only, no code. Stored as notes that every Researcher reads, with the ideas
-  about libraries outside the reader's track stripped at prompt time.
+  about libraries outside the reader's track stripped at prompt time. Packets describe the
+  competition, not the run, so the latest ones are reused for `scholar.reuse_runs` later
+  runs before the Scholar is asked again.
 - **Assessor** (interviews): a fixed small task per configured model, scored by CV. The
   resulting track record (valid modules, runs that succeeded, best OOF, tokens, latency)
   drives the allocation of tracks and rounds in later runs.
+- **Deterministic branches**: the default plan on every enabled family, then the plan
+  variants in `models.variants` on the fast families: `categorical` treats integer columns
+  with at most `models.low_cardinality_max` distinct values as categorical levels, `encoded`
+  target-encodes the categoricals and those integers inside each fold (the integers keep
+  their numeric column too). Then seed bags: the best `models.seed_bag_top` tree families
+  are retrained with `models.seed_bag` extra seeds. Every family of every branch is a pool
+  member. No LLM is involved, so these levers are tested on every run at a fixed cost.
 - **Ensembler**: the pool holds every experiment's OOF and test predictions across rounds
-  and agents, plus the deterministic baseline and seed-bagged replicas of the top
-  experiments. Hill climbing with replacement, rank average, and a logistic stacker on the
-  shared folds; the best honest OOF wins.
+  and agents, plus every deterministic branch member. Hill climbing with replacement, rank
+  average, and a logistic stacker on the shared folds; the best honest OOF wins.
 - **Submitter**: uploads whenever the pool blend beats the last upload by `min_improvement`,
   inside the daily quota.
 - **Historian**: the knowledge base across runs (experiments, notes, track records). Before
@@ -586,6 +602,11 @@ Per-experiment wall-clock and memory limits come from config.
   module's code) and `pitfalls` notes: the distinct failures seen on the competition with
   counts (API slips, timeouts, leaks, degenerate output), plus each track's own import
   violations. Every Researcher reads them every round.
+
+- **Router**: a failed call (after its retries) falls over to `backends.<name>.fallback_backend`
+  and `fallback_model`, which may be another model on the same hub; without them, to the
+  other backend. A circuit breaker skips a backend for `cooldown_seconds` after `trip_after`
+  consecutive failed calls, so a dead hub costs one call, not four attempts per call.
 
 ### 17.3 Knowledge base
 

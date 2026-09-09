@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS notes (
     kind         TEXT NOT NULL,
     text         TEXT NOT NULL,
     created_at   TEXT NOT NULL,
-    track        TEXT
+    track        TEXT,
+    origin_run   TEXT
 );
 CREATE TABLE IF NOT EXISTS model_track_record (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +134,7 @@ _MIGRATIONS: dict[int, list[str]] = {
     3: [],  # experiments and notes are CREATE TABLE IF NOT EXISTS in the base schema
     4: [],  # model_track_record likewise
     5: ["ALTER TABLE notes ADD COLUMN track TEXT"],  # notes addressed to one track
+    6: ["ALTER TABLE notes ADD COLUMN origin_run TEXT"],  # the run a reused note came from
 }
 
 RUN_STATUSES = ("running", "completed", "failed", "stopped")
@@ -488,13 +490,45 @@ class Ledger:
         text: str,
         run_id: str | None = None,
         track: str | None = None,
+        origin_run: str | None = None,
     ) -> int:
-        """A note; ``track`` addresses it to one Researcher track, None to every reader."""
+        """A note; ``track`` addresses it to one Researcher track, None to every reader;
+        ``origin_run`` records where a reused note was first produced."""
         return self._write(
-            "INSERT INTO notes (run_id, source, kind, text, created_at, track) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, source, kind, text, utcnow(), track),
+            "INSERT INTO notes (run_id, source, kind, text, created_at, track, origin_run) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, source, kind, text, utcnow(), track, origin_run),
         )
+
+    def latest_notes(
+        self, slug: str, kind: str, *, exclude_run: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Notes of ``kind`` from the most recent run on the slug that has any."""
+        clause = "" if exclude_run is None else " AND n.run_id != ?"
+        params: tuple[Any, ...] = (slug, kind, exclude_run) if exclude_run else (slug, kind)
+        row = self._one(
+            "SELECT n.run_id FROM notes n JOIN runs r ON r.id = n.run_id "
+            f"WHERE r.slug = ? AND n.kind = ?{clause} ORDER BY r.started_at DESC, n.id DESC "
+            "LIMIT 1",
+            params,
+        )
+        return [] if row is None else self.list_notes(row["run_id"], kind=kind)
+
+    def runs_since(self, slug: str, run_id: str, *, exclude_run: str | None = None) -> int:
+        """How many runs on the slug started after ``run_id``; a missing run counts as ancient."""
+        origin = self.get_run(run_id)
+        if origin is None:
+            return 10**6
+        clause = "" if exclude_run is None else " AND id != ?"
+        params: tuple[Any, ...] = (
+            (slug, origin["started_at"], exclude_run)
+            if exclude_run
+            else (slug, origin["started_at"])
+        )
+        row = self._one(
+            f"SELECT COUNT(*) AS n FROM runs WHERE slug = ? AND started_at > ?{clause}", params
+        )
+        return int(row["n"]) if row else 0
 
     def list_notes(
         self, run_id: str | None = None, kind: str | None = None, track: str | None = None

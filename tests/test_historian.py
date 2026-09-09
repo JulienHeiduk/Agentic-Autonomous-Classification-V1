@@ -223,6 +223,7 @@ def test_pitfalls_list_distinct_failures_with_counts(tmp_path):
     [error_line] = [ln for ln in lines if ln.startswith("- [error, 2x, last old on gbdt] ")]
     assert "TypeError: HistGradient" in error_line and "n_jobs'" in error_line
     assert "^^^" not in error_line and "File " not in error_line
+    assert error_line.endswith("[code: gb = HistGradientBoostingClassifier(**p)]")
     [timeout_line] = [ln for ln in lines if ln.startswith("- [timeout, 1x, last old on gbdt] ")]
     assert "did not finish within 1800s" in timeout_line
     assert "(hypothesis: CatBoost with 3-seed" in timeout_line
@@ -242,6 +243,13 @@ def test_pitfalls_list_distinct_failures_with_counts(tmp_path):
     assert [n["track"] for n in ledger.list_notes("new", kind="pitfalls", track="gbdt")] == [None]
     assert not record_pitfalls(ledger, "other", "new")
 
+    from aac.agents.historian import offending_line
+
+    assert offending_line(n_jobs) == "gb = HistGradientBoostingClassifier(**p)"
+    assert offending_line('  File "x.py", line 3, in f\n    y = 1 / 0\nZeroDivisionError: x') == (
+        "y = 1 / 0"
+    )
+    assert offending_line("plain message") == "" and offending_line(None) == ""
     assert error_tail("") == "(no error text)"
     assert error_tail('a\n    ^^^^\n  File "x.py", line 1\n') == "a"
     assert error_tail("x" * 500).endswith("x") and len(error_tail("x" * 500)) == 220

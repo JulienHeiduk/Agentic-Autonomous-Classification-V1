@@ -46,6 +46,10 @@ backends:
     cost_per_1k: 0.0
     timeout: 180               # per attempt; longest good module reply seen 144s (gpt-oss, 2026-09-06)
     max_concurrency: 4
+    fallback_backend: nvidia   # failed hub calls retry on nemotron-super, not on the local model
+    fallback_model: nvidia/nemotron-3-super-120b-a12b
+    trip_after: 2
+    cooldown_seconds: 600
 
 # Task tier -> backend (README section 5.3).
 router:
@@ -67,3 +71,4 @@ scholar:
   model: nvidia/nemotron-3-ultra-550b-a55b
   temperature: 0.7
   max_ideas: 8
+  reuse_runs: 3

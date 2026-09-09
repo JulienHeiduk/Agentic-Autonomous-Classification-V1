@@ -105,6 +105,9 @@ class RunConfig(StrictModel):
     parallel_branches: int = Field(2, ge=1)
     leak_threshold: float = Field(0.05, gt=0)
     degenerate_margin: float = Field(0.002, ge=0)  # min OOF gain over a constant prediction
+    # round_robin: every seat gets round n before any seat gets round n+1, so the budget is
+    # spread across tracks; sequential: one seat runs all its rounds, then the next.
+    schedule: Literal["round_robin", "sequential"] = "round_robin"
     n_jobs: int = Field(4, ge=1)  # fixed thread count: determinism needs it, never -1
     max_trees: int = Field(3000, ge=1)  # clamp on n_estimators / iterations / max_iter from plans
     max_rounds: int = Field(4, ge=1)  # experiments per Researcher unless the spec overrides it
@@ -115,10 +118,32 @@ class RunConfig(StrictModel):
     max_classes: int = Field(50, ge=2)  # more distinct target values than this is refused
 
 
+PlanVariant = Literal["categorical", "encoded"]
+
+
 class ModelsConfig(StrictModel):
     enabled: list[ModelFamily] = Field(default_factory=lambda: list(get_args(ModelFamily)))
     tuning: Literal["none", "optuna"] = "optuna"
     tuning_trials: int = Field(30, ge=1)
+    # Deterministic plan variants trained after the default plan (README 17.2): "categorical"
+    # treats low-cardinality integer columns as categorical; "encoded" target-encodes the
+    # categoricals and those integers inside each fold. Only variant_families run on them.
+    variants: list[PlanVariant] = Field(default_factory=lambda: ["categorical", "encoded"])
+    variant_families: list[ModelFamily] = Field(default_factory=lambda: ["lightgbm", "xgboost"])
+    low_cardinality_max: int = Field(50, ge=2)  # numeric columns with at most this many values
+    # Seed bagging: the best seed_bag_top tree families are retrained with seed_bag extra seeds
+    # and every replica joins the pool. 0 disables. Families slower than seed_bag_max_seconds
+    # on the base seed are skipped.
+    seed_bag: int = Field(2, ge=0)
+    seed_bag_top: int = Field(2, ge=1)
+    seed_bag_max_seconds: float = Field(120, gt=0)
+
+    @field_validator("variants")
+    @classmethod
+    def _unique_variants(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("models.variants has duplicates")
+        return v
 
     @field_validator("enabled")
     @classmethod
@@ -150,6 +175,14 @@ class BackendConfig(StrictModel):
     timeout: float = Field(120.0, gt=0)
     supports_json_mode: bool = True
     max_concurrency: int = Field(1, ge=1)
+    # Where a call goes after this backend fails its retries. None: the other backend in
+    # config order with its default model. The same backend with another model is allowed.
+    fallback_backend: str | None = None
+    fallback_model: str | None = None
+    # Circuit breaker: after trip_after consecutive failed calls (each already retried) the
+    # backend is skipped in favour of its fallback for cooldown_seconds.
+    trip_after: int = Field(2, ge=1)
+    cooldown_seconds: float = Field(600, ge=0)
 
     @field_validator("base_url")
     @classmethod
@@ -188,6 +221,9 @@ class ScholarConfig(StrictModel):
     temperature: float = Field(0.7, ge=0, le=2)
     angles: list[str] | None = None  # None: the three default angles
     max_ideas: int = Field(8, ge=1, le=20)
+    # Packets are competition knowledge, not run knowledge: reuse the latest ones for up to
+    # this many later runs on the slug before asking again. 0: ask every run.
+    reuse_runs: int = Field(3, ge=0)
 
 
 class AssessorConfig(StrictModel):
@@ -224,6 +260,17 @@ class Config(StrictModel):
         for i, spec in enumerate(self.researchers):
             if spec.backend not in self.backends:
                 raise ValueError(f"researchers[{i}] refers to unknown backend {spec.backend!r}")
+        for name, backend in self.backends.items():
+            if (
+                backend.fallback_backend is not None
+                and backend.fallback_backend not in self.backends
+            ):
+                raise ValueError(
+                    f"backends.{name}.fallback_backend refers to unknown backend "
+                    f"{backend.fallback_backend!r}"
+                )
+            if backend.fallback_model is not None and backend.fallback_backend is None:
+                raise ValueError(f"backends.{name}.fallback_model needs fallback_backend")
         return self
 
     @property

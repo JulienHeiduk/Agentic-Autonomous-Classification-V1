@@ -63,10 +63,22 @@ def test_end_to_end_label_competition(env, tmp_path, write_config, minimal_confi
     assert fake.uploads["tok-1"] == (run_dir / "submission.csv").read_bytes()
     with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
         assert ledger.get_run(summary.run_id)["status"] == "completed"
-        [b] = ledger.list_branches(summary.run_id)
+        branches = ledger.list_branches(summary.run_id)
+        b = branches[0]
         assert b["id"] == branch_ledger_id(summary.run_id, DEFAULT_BRANCH_NAME)
         assert b["status"] == "promoted" and b["cv_mean"] > 0.8 and len(b["fold_scores"]) == 4
         assert b["plan_json"]["name"] == "default" and b["plan_hash"] == summary.plan.hash()
+        # deterministic variants (lightgbm only: xgboost is not enabled here) and seed bags
+        names = [x.name for x in summary.branches]
+        assert names[:3] == [DEFAULT_BRANCH_NAME, "b01-categorical", "b02-encoded"]
+        assert [n.rsplit("-", 1)[-1] for n in names[3:]] == ["s43", "s43", "s44", "s44"]
+        assert all(x.status == "promoted" for x in summary.branches)
+        assert summary.branches[1].plan.categorical_columns == ["cat", "flag", "x3"]
+        assert summary.branches[2].plan.target_encode == ["cat", "flag", "x3"]
+        assert {x.seed for x in summary.branches[3:]} == {43, 44}
+        assert all(set(x.training.results) == {"lightgbm"} for x in summary.branches[3:])
+        assert len(branches) == 7 and all(r["status"] == "promoted" for r in branches)
+        assert len(summary.ensemble.members) == 2 + 2 + 4
         [sub] = ledger.list_submissions(summary.run_id)
         assert sub["public_score"] == 0.83 and sub["oof_score"] == summary.ensemble.best.oof_score
 
@@ -135,10 +147,9 @@ def test_not_entered_fails_at_upload_after_training(env, tmp_path, write_config,
         go(fake, tmp_path, config, submit=True)
     with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
         [r] = ledger.list_runs()
-        [b] = ledger.list_branches(r["id"])
-        assert r["status"] == "failed" and b["status"] == "promoted", (
-            "training survived, upload failed"
-        )
+        branches = ledger.list_branches(r["id"])
+        assert r["status"] == "failed" and len(branches) == 7, "default, 2 variants, 4 seed bags"
+        assert all(b["status"] == "promoted" for b in branches), "training survived, upload failed"
 
 
 def llm_config(write_config, minimal_config, **run_overrides):
@@ -315,12 +326,16 @@ def test_scholar_packets_and_priors_reach_researchers(env, tmp_path, write_confi
     with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
         assert len(ledger.list_notes(first.run_id, kind="research")) == 3
 
-    # a second run on the same competition sees the first run's best experiment as a prior
-    llm2 = FakeLLM({"nv.test": [packet, packet, packet, logistic]})
+    # a second run on the same competition sees the first run's best experiment as a prior,
+    # and reuses its research packets instead of asking the Scholar again
+    llm2 = FakeLLM({"nv.test": [logistic]})
     second = go_llm(kaggle, llm2, tmp_path, config, submit=False)
-    prompt2 = [c for c in llm2.calls("nv.test") if "Round 1 of" in c["messages"][-1]["content"]][0][
-        "messages"
-    ][-1]["content"]
+    assert all("Round 1 of" in c["messages"][-1]["content"] for c in llm2.calls("nv.test"))
+    prompt2 = llm2.calls("nv.test")[0]["messages"][-1]["content"]
+    assert "[research from scholar] Research packet" in prompt2 and "x1 times x2" in prompt2
+    with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
+        reused = ledger.list_notes(second.run_id, kind="research")
+        assert len(reused) == 3 and {n["origin_run"] for n in reused} == {first.run_id}
     assert "[prior from historian] Prior knowledge from earlier runs" in prompt2
     assert "for the 'linear' track" in prompt2, "priors are addressed per track"
     assert "def fit_predict" in prompt2 and first.run_id in prompt2
@@ -504,3 +519,47 @@ def test_replay_reproduces_a_stored_experiment(env, tmp_path, write_config, mini
         replay_experiment(
             "nope", config=config, runs_root=tmp_path / "runs", transport=kaggle.transport
         )
+
+
+def test_seats_take_turns_round_robin(env, tmp_path, write_config, minimal_config):
+    train, test, sample = make_frames(300, 100)
+    kaggle = FakeKaggle(bundle=bundle_from_frames(train, test, sample), metric="Roc Auc Score")
+    logistic = f"HYPOTHESIS: logistic\n```python\n{LOGISTIC}\n```"
+    minimal_config["models"] = {"enabled": ["logistic"], "tuning": "none"}
+    minimal_config["run"] = {
+        "n_folds": 4,
+        "n_jobs": 2,
+        "max_rounds": 2,
+        "patience": 5,
+        "parallel_branches": 1,
+    }
+    minimal_config["researchers"] = [
+        {"backend": "nvidia", "track": "linear"},
+        {"backend": "nvidia", "track": "open", "rounds": 1},
+    ]
+    config = load_config(write_config(minimal_config))
+    llm = FakeLLM({"nv.test": [logistic] * 3})
+    summary = go_llm(kaggle, llm, tmp_path, config, submit=False)
+    rounds = [
+        int(c["messages"][-1]["content"].rsplit("Round ", 1)[1].split(" ")[0])
+        for c in llm.calls("nv.test")
+    ]
+    assert rounds == [1, 1, 2], "both seats play round 1 before the first seat plays round 2"
+    assert [o.agent for o in summary.researchers] == ["r01-linear-nvidia", "r02-open-nvidia"]
+    linear, opened = summary.researchers
+    assert [e.round for e in linear.experiments] == [1, 2] and linear.n_ok == 2
+    assert [e.round for e in opened.experiments] == [1] and opened.n_ok == 1
+    assert linear.stopped_because == "rounds exhausted"
+    assert opened.stopped_because == "rounds exhausted"
+    assert "minutes of wall clock remain" in llm.calls("nv.test")[0]["messages"][-1]["content"]
+
+    # the sequential schedule runs one seat to the end before the next starts
+    minimal_config["run"]["schedule"] = "sequential"
+    config = load_config(write_config(minimal_config, "seq.yaml"))
+    llm = FakeLLM({"nv.test": [logistic] * 3})
+    go_llm(kaggle, llm, tmp_path, config, submit=False)
+    rounds = [
+        int(c["messages"][-1]["content"].rsplit("Round ", 1)[1].split(" ")[0])
+        for c in llm.calls("nv.test")
+    ]
+    assert rounds == [1, 2, 1]

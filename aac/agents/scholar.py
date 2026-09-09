@@ -74,6 +74,28 @@ def packet_to_note(angle: str, packet: Packet) -> str:
     return "\n".join(lines)
 
 
+def reuse_packets(ledger: Ledger, slug: str, run_id: str, *, max_age: int) -> int:
+    """Copy the latest research packets on the slug into this run when they were produced at
+    most ``max_age`` runs ago (packets describe the competition, not the run). Returns how
+    many were copied; 0 means the Scholar should be asked."""
+    if max_age <= 0:
+        return 0
+    notes = ledger.latest_notes(slug, "research", exclude_run=run_id)
+    if not notes:
+        return 0
+    origin = str(notes[0].get("origin_run") or notes[0]["run_id"])
+    age = ledger.runs_since(slug, origin, exclude_run=run_id)
+    if age >= max_age:
+        log.info("scholar: packets from run %s are %d runs old; asking again", origin, age)
+        return 0
+    for n in notes:
+        ledger.add_note(
+            source="scholar", kind="research", text=str(n["text"]), run_id=run_id, origin_run=origin
+        )
+    log.info("scholar: reusing %d packets from run %s (%d runs old)", len(notes), origin, age)
+    return len(notes)
+
+
 def research(
     router: Router,
     profile: Profile,

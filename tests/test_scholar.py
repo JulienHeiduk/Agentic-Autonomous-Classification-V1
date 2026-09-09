@@ -2,7 +2,7 @@ import json
 
 import httpx
 
-from aac.agents.scholar import DEFAULT_ANGLES, Packet, packet_to_note, research
+from aac.agents.scholar import DEFAULT_ANGLES, Packet, packet_to_note, research, reuse_packets
 from aac.agents.scout import profile_data
 from aac.config import CompetitionConfig, ScholarConfig, load_config
 from aac.ledger import Ledger
@@ -81,3 +81,36 @@ def test_research_runs_every_angle_and_records_notes(tmp_path, write_config, min
     angles_seen = {json.dumps(c["messages"][-1]["content"][:80]) for c in calls}
     assert len(angles_seen) >= 2
     assert any(a[:30] in calls[0]["messages"][-1]["content"] for a in DEFAULT_ANGLES)
+
+
+def test_reuse_packets_for_a_few_runs_then_ask_again(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+
+    def start(run_id: str, day: int) -> None:  # runs begin one after another, a day apart
+        ledger.create_run(run_id, "slug", "h", None)
+        ledger._conn.execute(
+            "UPDATE runs SET started_at = ? WHERE id = ?",
+            (f"2026-01-0{day}T00:00:00+00:00", run_id),
+        )
+        ledger._conn.commit()
+
+    start("a", 1)
+    assert reuse_packets(ledger, "slug", "a", max_age=3) == 0, "nothing to reuse yet"
+    for text in ("packet 1", "packet 2"):
+        ledger.add_note(source="scholar", kind="research", text=text, run_id="a")
+    start("b", 2)
+    assert reuse_packets(ledger, "slug", "b", max_age=0) == 0, "reuse disabled"
+    assert reuse_packets(ledger, "slug", "b", max_age=3) == 2
+    notes_b = ledger.list_notes("b", kind="research")
+    assert [n["text"] for n in notes_b] == ["packet 1", "packet 2"]
+    assert {n["origin_run"] for n in notes_b} == {"a"}
+    # c and d still reuse the packets from a (1 and 2 runs old); e is 3 runs old: ask again
+    start("c", 3)
+    assert reuse_packets(ledger, "slug", "c", max_age=3) == 2
+    start("d", 4)
+    assert reuse_packets(ledger, "slug", "d", max_age=3) == 2
+    assert {n["origin_run"] for n in ledger.list_notes("d", kind="research")} == {"a"}
+    start("e", 5)
+    assert reuse_packets(ledger, "slug", "e", max_age=3) == 0
+    ledger.create_run("other", "elsewhere", "h", None)
+    assert reuse_packets(ledger, "elsewhere", "other", max_age=3) == 0

@@ -414,13 +414,14 @@ backends: { ... }         # see §5.2
 ## 12. CLI
 
 ```
-aac run       --config configs/s6e9.yaml [--dry-run] [--no-submit] [--poll-timeout S]
+aac run       --config configs/s6e9.yaml [--dry-run] [--no-submit] [--poll-timeout S] [--repeat N]
 aac resume    --run-id 20260905-1432 [--config ...] [--no-submit]   # continue from the ledger and disk
 aac profile   --config configs/s6e9.yaml [--json]                  # Scout only, prints the profile
 aac replay    --experiment-id <run>-<agent>-r<n>                   # re-execute a stored experiment, check 1e-9
 aac submit    --config ... --run-id ...                            # upload a stored run's file (after quota reset)
 aac baseline  --config configs/s6e9.yaml [--no-submit]             # constant-prediction round trip
-aac ledger    --slug playground-series-s6e9                        # runs, branches, experiments, notes
+aac ledger    --slug playground-series-s6e9                        # runs, branches, experiments, notes, submissions
+aac scores    --slug playground-series-s6e9                        # write back public scores that were still pending
 aac doctor    [--config ...]                                       # env vars, backends, JSON contract, Kaggle
 ```
 
@@ -595,7 +596,11 @@ Per-experiment wall-clock and memory limits come from config.
   and agents, plus every deterministic branch member. Hill climbing with replacement, rank
   average, and a logistic stacker on the shared folds; the best honest OOF wins.
 - **Submitter**: uploads whenever the pool blend beats the last upload by `min_improvement`,
-  inside the daily quota.
+  inside the daily quota. An upload that Kaggle is still scoring when `--poll-timeout`
+  passes is recorded without a score and never fails the run; the next run, `aac submit`, or
+  `aac scores` writes the score back (and marks a run that failed only on that poll as
+  completed). `--repeat N` starts N runs one after another; a failed run does not stop the
+  next.
 - **Historian**: the knowledge base across runs (experiments, notes, track records). Before
   the Researchers start it writes one `prior` note per track (the best earlier experiments a
   Researcher on that track may build on, judged on the module's imports, with the top

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -94,9 +95,57 @@ def upload_submission(
     sid = ctx.ledger.record_submission(
         ctx.run_id, path.name, description=description, oof_score=oof_score, kaggle_ref=str(ref)
     )
-    final = kaggle.wait_for_score(slug, ref, timeout=poll_timeout, interval=poll_interval)
-    ctx.ledger.set_public_score(sid, final.public_score)
-    log.info("submission %d: %s public=%s", ref, final.status, final.public_score)
+    final = kaggle.wait_for_score(
+        slug, ref, timeout=poll_timeout, interval=poll_interval, raise_on_timeout=False
+    )
     if final.failed:
         raise KaggleError(f"submission {ref} failed: {final.error_description}")
+    if not final.settled:
+        # The upload succeeded; Kaggle is still scoring. The row keeps a NULL score until the
+        # next run, `aac submit`, or `aac scores` writes it back.
+        log.warning(
+            "submission %d still %s after %.0fs; the score will be written back later",
+            ref,
+            final.status,
+            poll_timeout,
+        )
+        return final
+    ctx.ledger.set_public_score(sid, final.public_score)
+    log.info("submission %d: %s public=%s", ref, final.status, final.public_score)
     return final
+
+
+PENDING_RUN_ERROR = "KaggleError: submission "
+
+
+def backfill_public_scores(ledger, kaggle: KaggleClient, slug: str) -> list[dict[str, Any]]:
+    """Write back the public scores of uploads that were still pending when their run ended,
+    and mark a run that failed only on that poll as completed. Returns the rows updated."""
+    pending = ledger.pending_submissions(slug)
+    if not pending:
+        return []
+    by_ref = {str(s.ref): s for s in kaggle.list_submissions(slug)}
+    updated: list[dict[str, Any]] = []
+    for row in pending:
+        sub = by_ref.get(str(row["kaggle_ref"]))
+        if sub is None or not sub.complete or sub.public_score is None:
+            continue
+        ledger.set_public_score(int(row["id"]), sub.public_score)
+        row = {**row, "public_score": sub.public_score}
+        updated.append(row)
+        run = ledger.get_run(str(row["run_id"]))
+        if (
+            run is not None
+            and run.get("status") == "failed"
+            and str(run.get("error") or "").startswith(
+                f"{PENDING_RUN_ERROR}{row['kaggle_ref']} still"
+            )
+        ):
+            ledger.set_run_status(str(row["run_id"]), "completed", None)
+            log.info(
+                "run %s: marked completed, its upload scored %.5f", row["run_id"], sub.public_score
+            )
+        log.info(
+            "submission %s: public score %.5f written back", row["kaggle_ref"], sub.public_score
+        )
+    return updated

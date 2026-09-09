@@ -172,3 +172,7 @@ def test_submit_failures(tmp_path):
     ref = kc.submit(SLUG, file, "x")
     with pytest.raises(KaggleError, match="still PENDING"):
         kc.wait_for_score(SLUG, ref, timeout=0, interval=1)
+    pending = kc.wait_for_score(SLUG, ref, timeout=0, interval=1, raise_on_timeout=False)
+    assert pending.ref == ref and not pending.settled and pending.public_score is None
+    unlisted = kc.wait_for_score(SLUG, 424242, timeout=0, interval=1, raise_on_timeout=False)
+    assert unlisted.ref == 424242 and unlisted.status == "PENDING" and not unlisted.settled

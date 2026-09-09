@@ -38,12 +38,16 @@ from aac.agents.researcher import (
 )
 from aac.agents.scholar import research, reuse_packets
 from aac.agents.scout import Profile, profile_data
-from aac.agents.submitter import upload_submission, write_prediction_file
+from aac.agents.submitter import (
+    backfill_public_scores,
+    upload_submission,
+    write_prediction_file,
+)
 from aac.agents.trainer import TrainResult, train_plan
 from aac.config import Config, ResearcherSpec, load_config
 from aac.context import Budget, BudgetExceeded, RunContext
 from aac.exec.artifacts import RunPaths, atomic_write_json
-from aac.kaggle.api import CompetitionInfo, KaggleClient
+from aac.kaggle.api import CompetitionInfo, KaggleClient, KaggleError
 from aac.kaggle.data import ensure_data
 from aac.ledger import Ledger
 from aac.llm.client import LLMError
@@ -422,6 +426,22 @@ def _load_data(
     )
 
 
+def _backfill_scores(ledger: Ledger, kaggle: KaggleClient, slug: str) -> None:
+    """Earlier uploads that were still scoring when their run ended get their score now."""
+    try:
+        updated = backfill_public_scores(ledger, kaggle, slug)
+    except KaggleError as exc:
+        log.warning("public score backfill skipped: %s", exc)
+        return
+    for row in updated:
+        log.info(
+            "backfilled run %s submission %s: public %.5f",
+            row["run_id"],
+            row["kaggle_ref"],
+            row["public_score"],
+        )
+
+
 def _verify_backends(router: Router) -> None:
     t = time.monotonic()
     try:
@@ -738,6 +758,7 @@ def run(
                 sleep=sleep,
             )
             info, data = _load_data(ctx, kaggle, config)
+            _backfill_scores(ctx.ledger, kaggle, config.competition.slug)
             metric_key = data.metric.key
             summary.profile = data.profile
             ctx.ledger.add_note(
@@ -842,6 +863,7 @@ def resume(
                 config, ledger=ledger, budget=budget, run_id=run_id, client=http, sleep=sleep
             )
             info, data = _load_data(ctx, kaggle, config)
+            _backfill_scores(ctx.ledger, kaggle, config.competition.slug)
             metric_key = data.metric.key
             summary.profile = data.profile
             if config.researcher_specs():
@@ -942,6 +964,7 @@ def submit_run(
     try:
         with KaggleClient.from_env(client=http, sleep=sleep) as kaggle:
             info = kaggle.competition(config.competition.slug)
+            _backfill_scores(ledger, kaggle, config.competition.slug)
             score_text = f"{oof_score:.5f}" if oof_score is not None else "unknown"
             final = upload_submission(
                 ctx,

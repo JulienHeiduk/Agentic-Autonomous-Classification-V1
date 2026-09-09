@@ -615,6 +615,15 @@ class Ledger:
             "UPDATE submissions SET public_score = ? WHERE id = ?", (public_score, submission_id)
         )
 
+    def pending_submissions(self, slug: str) -> list[dict[str, Any]]:
+        """Uploads on a competition that never received a public score."""
+        return self._rows(
+            "SELECT s.* FROM submissions s JOIN runs r ON r.id = s.run_id "
+            "WHERE r.slug = ? AND s.public_score IS NULL AND s.kaggle_ref IS NOT NULL "
+            "ORDER BY s.submitted_at",
+            (slug,),
+        )
+
     def list_submissions(self, run_id: str | None = None) -> list[dict[str, Any]]:
         if run_id is None:
             return self._rows("SELECT * FROM submissions ORDER BY submitted_at DESC")

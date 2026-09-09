@@ -50,18 +50,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(args.config)
     if config is None:
         return EXIT_USAGE
-    try:
-        summary = run(
-            config,
-            submit=not args.no_submit,
-            dry_run=args.dry_run,
-            poll_timeout=args.poll_timeout,
-            console=console,
-        )
-    except Exception as exc:  # noqa: BLE001 - the CLI boundary reports and exits
-        err_console.print(f"[red]run failed:[/red] {exc.__class__.__name__}: {exc}")
-        return EXIT_FAILURE
-    return EXIT_OK if summary.status == "completed" else EXIT_FAILURE
+    repeat = max(1, int(getattr(args, "repeat", 1) or 1))
+    failures = 0
+    for i in range(1, repeat + 1):
+        label = "run" if repeat == 1 else f"run {i} of {repeat}"
+        if repeat > 1:
+            console.print(f"[bold]{label}[/bold]")
+        try:
+            summary = run(
+                config,
+                submit=not args.no_submit,
+                dry_run=args.dry_run,
+                poll_timeout=args.poll_timeout,
+                console=console,
+            )
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary reports and goes on
+            err_console.print(f"[red]{label} failed:[/red] {exc.__class__.__name__}: {exc}")
+            failures += 1
+            continue
+        if summary.status != "completed":
+            failures += 1
+    return EXIT_OK if failures == 0 else EXIT_FAILURE
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -224,6 +233,54 @@ def cmd_ledger(args: argparse.Namespace) -> int:
     for n in notes:
         table.add_row(str(n["run_id"]), str(n["kind"]), str(n["source"]), str(n["text"])[:100])
     console.print(table)
+    run_ids = {r["id"] for r in runs}
+    with Ledger(path) as ledger:
+        submissions = [s for s in ledger.list_submissions() if s["run_id"] in run_ids]
+    table = Table(title="submissions (public score empty = still scoring; run `aac scores`)")
+    for col in ("run_id", "oof_score", "public_score", "kaggle_ref", "submitted_at", "description"):
+        table.add_column(col)
+    for sub in submissions[: args.limit]:
+        table.add_row(
+            str(sub["run_id"]),
+            f"{sub['oof_score']:.5f}" if sub["oof_score"] is not None else "",
+            f"{sub['public_score']:.5f}" if sub["public_score"] is not None else "",
+            str(sub["kaggle_ref"] or ""),
+            str(sub["submitted_at"]),
+            str(sub["description"] or "")[:60],
+        )
+    console.print(table)
+    return EXIT_OK
+
+
+def cmd_scores(args: argparse.Namespace) -> int:
+    """Write back the public scores of uploads that were still pending when their run ended."""
+    from pathlib import Path
+
+    from aac.agents.submitter import backfill_public_scores
+    from aac.exec.artifacts import RunPaths
+    from aac.kaggle.api import KaggleClient, KaggleError
+    from aac.ledger import Ledger
+
+    path = RunPaths(Path("runs"), "_").ledger_path
+    if not path.exists():
+        err_console.print(f"no ledger at {path}")
+        return EXIT_FAILURE
+    try:
+        with Ledger(path) as ledger, KaggleClient.from_env() as kaggle:
+            updated = backfill_public_scores(ledger, kaggle, args.slug)
+            still = ledger.pending_submissions(args.slug)
+    except KaggleError as exc:
+        err_console.print(f"[red]scores failed:[/red] {exc}")
+        return EXIT_FAILURE
+    for row in updated:
+        console.print(
+            f"run {row['run_id']} submission {row['kaggle_ref']}: public score "
+            f"{row['public_score']:.5f} written back"
+        )
+    for row in still:
+        console.print(f"run {row['run_id']} submission {row['kaggle_ref']}: still pending")
+    if not updated and not still:
+        console.print(f"no pending submissions for {args.slug}")
     return EXIT_OK
 
 
@@ -296,6 +353,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="plan and profile only, no training")
     p.add_argument("--no-submit", action="store_true", help="never upload to Kaggle")
     p.add_argument("--poll-timeout", type=float, default=600.0, metavar="SECONDS")
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="start N runs one after another; a failed run does not stop the next",
+    )
     p.set_defaults(handler=cmd_run)
 
     p = sub.add_parser("resume", help="continue a crashed or stopped run from the ledger")
@@ -319,6 +383,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slug", required=True)
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(handler=cmd_ledger)
+
+    p = sub.add_parser(
+        "scores", help="fetch the public scores of uploads that were still pending at run end"
+    )
+    p.add_argument("--slug", required=True)
+    p.set_defaults(handler=cmd_scores)
 
     p = sub.add_parser(
         "baseline", help="download data, submit a constant-prediction baseline, record the score"

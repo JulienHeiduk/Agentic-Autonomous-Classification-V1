@@ -410,9 +410,17 @@ class KaggleClient:
         return None
 
     def wait_for_score(
-        self, slug: str, ref: int, *, timeout: float = 600.0, interval: float = 15.0
+        self,
+        slug: str,
+        ref: int,
+        *,
+        timeout: float = 600.0,
+        interval: float = 15.0,
+        raise_on_timeout: bool = True,
     ) -> Submission:
-        """Poll the submission list until ``ref`` is COMPLETE or ERROR."""
+        """Poll the submission list until ``ref`` is COMPLETE or ERROR. When the timeout
+        passes first: raise, or with ``raise_on_timeout`` False return the pending row (Kaggle
+        keeps scoring; the score is fetched later)."""
         deadline = time.monotonic() + timeout
         last: Submission | None = None
         while True:
@@ -421,5 +429,7 @@ class KaggleClient:
                 return last
             if time.monotonic() >= deadline:
                 state = last.status if last else "not listed"
-                raise KaggleError(f"submission {ref} still {state} after {timeout:.0f}s")
+                if raise_on_timeout:
+                    raise KaggleError(f"submission {ref} still {state} after {timeout:.0f}s")
+                return last or Submission(ref, None, "", "", "PENDING", None, None, "")
             self._sleep(interval)

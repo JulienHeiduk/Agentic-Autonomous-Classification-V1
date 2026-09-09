@@ -8,6 +8,7 @@ SUBCOMMANDS = {
     "profile": ["--config", "configs/s6e9.yaml"],
     "replay": ["--experiment-id", "20260906-1200-r01-open-nvidia-r1"],
     "ledger": ["--slug", "playground-series-s6e9"],
+    "scores": ["--slug", "playground-series-s6e9"],
     "doctor": [],
     "submit": ["--config", "configs/s6e9.yaml", "--run-id", "20260906-1200"],
 }
@@ -38,7 +39,9 @@ def test_every_readme_subcommand_parses(name):
     assert callable(args.handler)
 
 
-@pytest.mark.parametrize("name", ["run", "resume", "profile", "replay", "ledger", "submit"])
+@pytest.mark.parametrize(
+    "name", ["run", "resume", "profile", "replay", "ledger", "scores", "submit"]
+)
 def test_required_arguments_are_enforced(name):
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args([name])
@@ -47,7 +50,35 @@ def test_required_arguments_are_enforced(name):
 
 def test_run_flags():
     args = build_parser().parse_args(["run", "--config", "c.yaml", "--dry-run", "--no-submit"])
-    assert args.dry_run and args.no_submit
+    assert args.dry_run and args.no_submit and args.repeat == 1
+    args = build_parser().parse_args(["run", "--config", "c.yaml", "--repeat", "5"])
+    assert args.repeat == 5
+
+
+def test_repeat_runs_every_time_even_after_a_failure(
+    tmp_path, monkeypatch, capsys, write_config, minimal_config
+):
+    import aac.cli as cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NV_KEY", "k")
+    write_config(minimal_config)
+    calls = []
+
+    def fake_run(config, **kw):
+        calls.append(kw)
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        from types import SimpleNamespace
+
+        return SimpleNamespace(status="completed")
+
+    monkeypatch.setattr("aac.orchestrator.run", fake_run)
+    code = cli.main(["run", "--config", "c.yaml", "--repeat", "3", "--no-submit"])
+    assert len(calls) == 3, "the failed second run did not stop the third"
+    assert code == EXIT_FAILURE
+    out = capsys.readouterr()
+    assert "run 2 of 3 failed" in out.err and "run 3 of 3" in out.out
 
 
 def test_failing_command_reports_loudly(tmp_path, monkeypatch, capsys):

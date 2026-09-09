@@ -23,6 +23,7 @@ the README, and note findings that change later work.
 | 12 | Hardening and unattended runs | done | 2026-09-06 |
 | 13 | Track-safe knowledge, pitfalls memory, degenerate check | done | 2026-09-08 |
 | 14 | Deterministic levers, hub resilience, round-robin seats, packet reuse | done | 2026-09-08 |
+| 15 | Pending public scores, score backfill, `aac scores`, `--repeat` | done | 2026-09-09 |
 
 ## Done
 
@@ -504,6 +505,30 @@ target-encoding IndexError again), and the local linear seat went 0/4 on code qu
 whether target encoding and level handling move the third decimal. If they do not, the
 remaining gap to 0.9467 is the original dataset, and the Researcher layer is the wrong place
 to look.
+
+### 15. Pending public scores, score backfill, `aac scores`, `--repeat` (2026-09-09)
+
+Run 20260908-2031 (the first with milestone 14) ended with `KaggleError: submission 56105975
+still PENDING after 600s` and was recorded as failed, although Kaggle scored the upload a
+few minutes later at 0.94186, the best public score so far. The morning run 20260909-0746
+completed at OOF 0.94206 / public 0.94185 with 20 pool members, reused packets from run
+1609, and had no hub failure.
+
+- `wait_for_score(raise_on_timeout=False)` returns the pending row; `upload_submission` logs
+  a warning and returns it instead of raising. The submission row keeps a NULL score.
+- `backfill_public_scores` (Submitter) fills NULL scores from one `ListSubmissions` call and
+  marks a run that failed only on that poll as completed. Called at the start of every run
+  and resume, in `aac submit`, and by the new `aac scores --slug` command. `aac ledger` now
+  prints the submissions table.
+- `aac run --repeat N` starts N runs sequentially; a failed run does not stop the next.
+- Tests: non-raising poll, a run whose score stays pending completes and is backfilled by
+  the next run, the repeat loop survives a failed run.
+
+Milestone 14 readings from the two runs: `categorical` variant 0.94101 (worse than the
+default 0.94181), `encoded` 0.94167 (close but below), seed bags 0.94174 / 0.94175. The
+stacker still gained: OOF 0.94209 and 0.94206 against 0.94200 before, public 0.94186 and
+0.94185 against 0.94178. Target encoding and level handling are not the half-point lever on
+this table.
 
 ## Reference write-up: gap analysis (2026-09-06)
 

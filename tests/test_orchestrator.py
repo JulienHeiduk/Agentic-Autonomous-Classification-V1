@@ -1,6 +1,7 @@
 import io
 import json
 
+import httpx
 import pytest
 from rich.console import Console
 
@@ -563,3 +564,64 @@ def test_seats_take_turns_round_robin(env, tmp_path, write_config, minimal_confi
         for c in llm.calls("nv.test")
     ]
     assert rounds == [1, 2, 1]
+
+
+def test_pending_score_does_not_fail_the_run_and_is_backfilled_later(
+    env, tmp_path, write_config, minimal_config
+):
+    from aac.agents.submitter import backfill_public_scores
+    from aac.kaggle.api import KaggleClient
+
+    train, test, sample = make_frames(200, 60)
+    # Kaggle keeps the upload PENDING for longer than the poll window
+    kaggle = FakeKaggle(
+        bundle=bundle_from_frames(train, test, sample),
+        metric="Roc Auc Score",
+        pending_polls=10**6,
+        public_score=0.87,
+    )
+    config = fast_config(write_config, minimal_config)
+    summary = go(kaggle, tmp_path, config, submit=True, poll_timeout=0.0)
+    assert summary.status == "completed" and summary.uploads == 1
+    assert summary.public_score is None, "not scored yet"
+    with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
+        [sub] = ledger.list_submissions(summary.run_id)
+        assert sub["public_score"] is None and sub["kaggle_ref"]
+        assert ledger.get_run(summary.run_id)["status"] == "completed"
+        [pending] = ledger.pending_submissions("playground-series-s6e9")
+        assert pending["id"] == sub["id"]
+        # the old behaviour left such a run failed; the backfill repairs that too
+        ledger.set_run_status(
+            summary.run_id, "failed", f"KaggleError: submission {sub['kaggle_ref']} still PENDING"
+        )
+        with KaggleClient.from_env(client=httpx.Client(transport=kaggle.transport)) as kc:
+            assert backfill_public_scores(ledger, kc, "playground-series-s6e9") == []
+            # Kaggle finishes scoring
+            for row in kaggle.submissions:
+                row["status"], row["publicScore"] = "COMPLETE", "0.87"
+            [updated] = backfill_public_scores(ledger, kc, "playground-series-s6e9")
+        assert updated["public_score"] == 0.87
+        assert ledger.list_submissions(summary.run_id)[0]["public_score"] == 0.87
+        assert ledger.pending_submissions("playground-series-s6e9") == []
+        run_row = ledger.get_run(summary.run_id)
+        assert run_row["status"] == "completed" and run_row["error"] is None
+
+    # the next run on the competition writes the score back by itself
+    kaggle2 = FakeKaggle(
+        bundle=bundle_from_frames(train, test, sample),
+        metric="Roc Auc Score",
+        submissions=[
+            {"ref": 77, "date": "2026-01-01T00:00:00Z", "status": "COMPLETE", "publicScore": "0.9"}
+        ],
+        pending_polls=0,
+        public_score=0.91,
+    )
+    with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
+        [sub] = ledger.list_submissions(summary.run_id)
+        ledger.set_public_score(sub["id"], None)
+        ledger._conn.execute("UPDATE submissions SET kaggle_ref = '77' WHERE id = ?", (sub["id"],))
+        ledger._conn.commit()
+    second = go(kaggle2, tmp_path, config, submit=False)
+    assert second.status == "completed"
+    with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
+        assert ledger.list_submissions(summary.run_id)[0]["public_score"] == 0.9

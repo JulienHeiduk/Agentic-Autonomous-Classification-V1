@@ -21,7 +21,7 @@ from aac.agents.scout import Profile
 from aac.exec.artifacts import atomic_write_bytes, atomic_write_json
 from aac.models.cv import CVResult, cross_validate
 from aac.models.metrics import MetricSpec, score
-from aac.models.prepare import Matrix, prepare_matrix
+from aac.models.prepare import Matrix, add_flag, prepare_matrix
 from aac.plan import Plan
 
 log = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ class TrainResult:
     blend_oof_score: float
     duration: float
     errors: dict[str, str] = field(default_factory=dict)
+    n_extra: int = 0  # extra training rows appended to every fold
 
     @property
     def best(self) -> CVResult:
@@ -47,6 +48,7 @@ class TrainResult:
         return {
             "plan_hash": self.plan_hash,
             "metric": self.metric,
+            "n_extra": self.n_extra,
             "n_features": len(self.features),
             "features": self.features,
             "categorical": self.categorical,
@@ -115,24 +117,34 @@ def train_plan(
     branch_dir: Path,
     max_trees: int | None = None,
     families: list[str] | None = None,
+    extra: pd.DataFrame | None = None,
+    extra_y: np.ndarray | None = None,
+    extra_flag: str | None = None,
 ) -> TrainResult:
-    """Train every family of the plan (or only ``families``) on the shared folds."""
+    """Train every family of the plan (or only ``families``) on the shared folds. ``extra``
+    rows (with ``extra_y``) join the training part of every fold, never validation."""
     started = time.monotonic()
     n_classes = len(profile.target.classes)
     features, categorical = select_features(plan, profile, train, test)
-    matrix: Matrix = prepare_matrix(train, test, features, categorical)
+    matrix: Matrix = prepare_matrix(train, test, features, categorical, extra=extra)
+    matrix = add_flag(matrix, extra_flag)
+    features = matrix.features
+    extra_pair = None
+    if matrix.X_extra is not None and extra_y is not None and len(matrix.X_extra):
+        extra_pair = (matrix.X_extra, np.asarray(extra_y))
     models = [m for m in plan.models if families is None or m.family in families]
     if not models:
         raise ValueError(f"plan {plan.name!r} has none of the families {families}")
     log.info(
         "training plan %s (seed %d): %d features (%d categorical, %d target-encoded), "
-        "%d rows, %d families",
+        "%d rows + %d extra, %d families",
         plan.name,
         seed,
         len(features),
         len(categorical),
         len(plan.target_encode),
         len(train),
+        matrix.n_extra,
         len(models),
     )
     results: dict[str, CVResult] = {}
@@ -154,6 +166,7 @@ def train_plan(
                 n_jobs=n_jobs,
                 early_stopping=model.early_stopping,
                 target_encode=plan.target_encode,
+                extra=extra_pair,
             )
         except Exception as exc:  # noqa: BLE001 - one family failing must not sink the branch
             log.exception("family %s failed", model.family)
@@ -188,6 +201,7 @@ def train_plan(
         blend_oof_score=blend_score,
         duration=time.monotonic() - started,
         errors=errors,
+        n_extra=matrix.n_extra,
     )
     _save(branch_dir / "oof.npy", results[best_family].oof)
     _save(branch_dir / "test_pred.npy", results[best_family].test_pred)

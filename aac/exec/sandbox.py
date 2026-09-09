@@ -433,8 +433,14 @@ def run_experiment(
     memory_mb: int = 8192,
     n_threads: int = 4,
     determinism_rows: int = 5000,
+    extra_train: Path | None = None,
+    extra_y: np.ndarray | None = None,
+    extra_flag: str | None = None,
 ) -> ExperimentResult:
-    """Static check, then run the module's fit_predict per fold in the subprocess and score."""
+    """Static check, then run the module's fit_predict per fold in the subprocess and score.
+
+    ``extra_train`` (a target-free frame with the train columns) and ``extra_y`` are rows the
+    harness appends to every fold's training part, never to validation."""
     workdir = Path(workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     module_path = workdir / "experiment.py"
@@ -453,6 +459,10 @@ def run_experiment(
         stale.unlink(missing_ok=True)
     np.save(y_path, np.asarray(y))
     np.save(folds_path, np.asarray(folds))
+    extra_y_path = None
+    if extra_train is not None and extra_y is not None and len(extra_y):
+        extra_y_path = workdir / "extra_y.npy"
+        np.save(extra_y_path, np.asarray(extra_y))
     atomic_write_json(
         workdir / "job.json",
         {
@@ -460,6 +470,9 @@ def run_experiment(
             "module": str(module_path),
             "train": str(Path(train_path).resolve()),
             "test": str(Path(test_path).resolve()),
+            "extra_train": str(Path(extra_train).resolve()) if extra_y_path else None,
+            "extra_y": str(extra_y_path) if extra_y_path else None,
+            "extra_flag": extra_flag if extra_y_path else None,
             "y": str(y_path),
             "folds": str(folds_path),
             "oof_out": str(oof_path),

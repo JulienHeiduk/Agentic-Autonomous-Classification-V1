@@ -219,6 +219,14 @@ def _run_experiment(namespace) -> None:  # type: ignore[no-untyped-def]
 
     train = pd.read_parquet(JOB["train"])
     test = pd.read_parquet(JOB["test"])
+    n_train = len(train)
+    extra_y = None
+    if JOB.get("extra_train") and JOB.get("extra_y"):
+        # Extra rows ride along with train through build_features and the matrix (shared
+        # vocabulary), then split off; they join the training part of every fold below.
+        extra = pd.read_parquet(JOB["extra_train"])[list(train.columns)]
+        extra_y = np.load(JOB["extra_y"])
+        train = pd.concat([train, extra], ignore_index=True)
     new_columns: list[str] = []
     feature_seconds = 0.0
     if callable(build_features):
@@ -238,11 +246,27 @@ def _run_experiment(namespace) -> None:  # type: ignore[no-untyped-def]
         _fail("no feature columns left after dropping id and unusable columns", "violation")
     matrix = prepare_matrix(train, test, features, categorical)
     X, X_test = matrix.X_train, matrix.X_test
+    X_extra = None
+    if extra_y is not None:
+        X_extra = X.iloc[n_train:].reset_index(drop=True)
+        X = X.iloc[:n_train].reset_index(drop=True)
+        flag = JOB.get("extra_flag")
+        if flag and flag not in features:
+            X[flag], X_test[flag], X_extra[flag] = 0.0, 0.0, 1.0
+            features = [*features, flag]
     y = np.load(JOB["y"])
     folds = np.load(JOB["folds"])
     n_classes = int(meta["n_classes"])
     n_folds = int(folds.max()) + 1
-    meta.update({"features": features, "categorical": matrix.categorical, "n_folds": n_folds})
+    meta.update(
+        {
+            "features": features,
+            "categorical": matrix.categorical,
+            "n_folds": n_folds,
+            "n_extra": 0 if X_extra is None else len(X_extra),
+            "extra_flag": JOB.get("extra_flag") if X_extra is not None else None,
+        }
+    )
 
     oof = np.zeros(len(X)) if n_classes == 2 else np.zeros((len(X), n_classes))
     test_sum = np.zeros(len(X_test)) if n_classes == 2 else np.zeros((len(X_test), n_classes))
@@ -250,9 +274,13 @@ def _run_experiment(namespace) -> None:  # type: ignore[no-untyped-def]
     for k in range(n_folds):
         tr = folds != k
         started = time.monotonic()
+        X_tr, y_tr = X[tr], y[tr]
+        if X_extra is not None:
+            X_tr = pd.concat([X_tr, X_extra], ignore_index=True)
+            y_tr = np.concatenate([y_tr, extra_y])
         try:
             p_va, p_te = _call_fit_predict(
-                fit_predict, X[tr], y[tr], X[~tr], X_test, {**meta, "fold": k}
+                fit_predict, X_tr, y_tr, X[~tr], X_test, {**meta, "fold": k}
             )
         except Exception:
             _fail(f"fold {k}: " + traceback.format_exc(), "error")
@@ -265,20 +293,24 @@ def _run_experiment(namespace) -> None:  # type: ignore[no-untyped-def]
     tr0 = np.flatnonzero(folds != 0)[:rows]
     va0 = np.flatnonzero(folds == 0)[: max(50, rows // 5)]
     te0 = np.arange(min(len(X_test), max(50, rows // 5)))
+    X_d, y_d = X.iloc[tr0], y[tr0]
+    if X_extra is not None:  # the contract holds here too: extras are always in X_train
+        X_d = pd.concat([X_d, X_extra], ignore_index=True)
+        y_d = np.concatenate([y_d, extra_y])
     if len(tr0) >= 50 and len(va0) >= 20 and len(np.unique(y[tr0])) == n_classes:
         try:
             a = _call_fit_predict(
                 fit_predict,
-                X.iloc[tr0],
-                y[tr0],
+                X_d,
+                y_d,
                 X.iloc[va0],
                 X_test.iloc[te0],
                 {**meta, "fold": 0, "determinism_check": True},
             )
             b = _call_fit_predict(
                 fit_predict,
-                X.iloc[tr0],
-                y[tr0],
+                X_d,
+                y_d,
                 X.iloc[va0],
                 X_test.iloc[te0],
                 {**meta, "fold": 0, "determinism_check": True},

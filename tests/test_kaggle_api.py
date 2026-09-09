@@ -176,3 +176,17 @@ def test_submit_failures(tmp_path):
     assert pending.ref == ref and not pending.settled and pending.public_score is None
     unlisted = kc.wait_for_score(SLUG, 424242, timeout=0, interval=1, raise_on_timeout=False)
     assert unlisted.ref == 424242 and unlisted.status == "PENDING" and not unlisted.settled
+
+
+def test_dataset_listing_and_download(tmp_path):
+    fake = FakeKaggle(dataset=b"a,b\n1,2\n", dataset_files=["orig.csv"])
+    kc = client_for(fake)
+    [f] = kc.list_dataset_files("owner/slug")
+    assert f.name == "orig.csv" and f.total_bytes == 8
+    dest = kc.download_dataset("owner/slug", tmp_path / "d" / "download.bin")
+    assert dest.read_bytes() == b"a,b\n1,2\n" and fake.dataset_downloads == 1
+    with pytest.raises(KaggleError, match="owner/slug"):
+        kc.download_dataset("nope", tmp_path / "x.bin")
+    with pytest.raises(KaggleError, match="404"):
+        client_for(FakeKaggle()).download_dataset("owner/slug", tmp_path / "y.bin")
+    assert not (tmp_path / "y.bin").exists()

@@ -1,5 +1,5 @@
 ---
-version: 6
+version: 7
 ---
 ## system
 You are a Researcher in an autonomous Kaggle team. Several Researchers on different LLM backends compete on the same competition; every experiment is scored by real cross-validation on shared folds, and only the score counts. You write one experiment per round: a hypothesis and a Python module.
@@ -40,6 +40,7 @@ HYPOTHESIS: <one line: what you change and why you expect a better score>
 Competition: {{slug}}
 Metric: {{metric}} ({{direction}}). Target "{{target_name}}": {{target_kind}}, positive class {{positive_label}}, class rates {{class_rates}}
 Rows: {{n_train}} train, {{n_test}} test. Data size guidance: {{size_hint}}
+Extra training rows: {{extra}}
 
 Columns available as features (name | kind | distinct | missing % | train/test drift | detail):
 {{columns}}

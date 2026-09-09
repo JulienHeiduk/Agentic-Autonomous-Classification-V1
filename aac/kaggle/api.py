@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 
 KAGGLE_API = "https://api.kaggle.com/v1"
 COMPETITIONS_SERVICE = "competitions.CompetitionApiService"
+DATASETS_SERVICE = "datasets.DatasetApiService"
 _MAX_PAGES = 50
 
 
@@ -262,26 +263,60 @@ class KaggleClient:
 
     def download_all(self, slug: str, dest: Path) -> Path:
         """Stream the competition bundle to ``dest``. Atomic: a partial file never survives."""
+        return self._download("DownloadDataFiles", {"competitionName": slug}, dest, slug)
+
+    # -- datasets -------------------------------------------------------------------------
+
+    @staticmethod
+    def _dataset_body(ref: str) -> dict[str, str]:
+        owner, _, name = ref.partition("/")
+        if not owner or not name:
+            raise KaggleError(f"dataset ref {ref!r} must be owner/slug")
+        return {"ownerSlug": owner, "datasetSlug": name}
+
+    def list_dataset_files(self, ref: str) -> list[DataFile]:
+        data = self.call("ListDatasetFiles", self._dataset_body(ref), service=DATASETS_SERVICE)
+        return [
+            DataFile(str(i.get("name")), int(i.get("totalBytes") or 0), i.get("creationDate"))
+            for i in data.get("datasetFiles") or []
+        ]
+
+    def download_dataset(self, ref: str, dest: Path) -> Path:
+        """Stream a whole dataset to ``dest``: a zip for several files, the file itself for
+        one (the caller looks at the bytes)."""
+        return self._download(
+            "DownloadDataset", self._dataset_body(ref), dest, ref, service=DATASETS_SERVICE
+        )
+
+    def _download(
+        self,
+        method: str,
+        body: dict[str, Any],
+        dest: Path,
+        what: str,
+        *,
+        service: str = COMPETITIONS_SERVICE,
+    ) -> Path:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
         self._forget_cookies()
         try:
             first = self._http.post(
-                self._url("DownloadDataFiles"),
-                json={"competitionName": slug},
+                self._url(method, service),
+                json=body,
                 headers=self._headers,
                 auth=self._auth,
                 follow_redirects=False,
                 timeout=self.timeout,
             )
         except httpx.HTTPError as exc:
-            raise KaggleError(f"DownloadDataFiles: {exc.__class__.__name__}: {exc}") from exc
-        self._check(first, "DownloadDataFiles")
+            raise KaggleError(f"{method}: {exc.__class__.__name__}: {exc}") from exc
+        self._check(first, method)
         if first.is_redirect:
             location = first.headers.get("location")
             if not location:
-                raise KaggleError("DownloadDataFiles: redirect without a Location header")
+                raise KaggleError(f"{method}: redirect without a Location header")
             request = self._http.build_request(
                 "GET", location, timeout=httpx.Timeout(self.timeout, read=600.0)
             )
@@ -325,7 +360,7 @@ class KaggleClient:
             tmp.unlink(missing_ok=True)
             raise KaggleError(f"download: got {received} bytes, expected {expected}")
         os.replace(tmp, dest)
-        log.info("downloaded %s (%d bytes) to %s", slug, received, dest)
+        log.info("downloaded %s (%d bytes) to %s", what, received, dest)
         return dest
 
     # -- submissions ----------------------------------------------------------------------

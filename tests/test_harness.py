@@ -3,6 +3,7 @@
 import textwrap
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from aac.exec.sandbox import EXPERIMENT_IMPORTS, check_source, run_experiment
@@ -222,3 +223,49 @@ def test_target_leak_via_name_is_rejected_statically(data, tmp_path):
     code = "def fit_predict(a, b, c, d, e):\n    return c['target'].values, d['x1'].values\n"
     r = run(code, data, tmp_path)
     assert not r.ok and r.kind == "rejected" and "target column" in r.error
+
+
+EXTRA_AWARE = textwrap.dedent(
+    """
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+
+    def fit_predict(X_train, y_train, X_valid, X_test, meta):
+        n_extra = meta["n_extra"]
+        assert n_extra == 30, meta
+        assert len(X_train) == len(y_train)
+        assert X_train["is_original"].sum() == n_extra, "extras carry the flag"
+        assert X_train["is_original"].iloc[-n_extra:].eq(1.0).all(), "extras come last"
+        assert X_valid["is_original"].sum() == 0 and X_test["is_original"].sum() == 0
+        assert "is_original" in meta["features"]
+        cols = ["x1", "x2", "x3"]
+        m = LogisticRegression(max_iter=200).fit(X_train[cols].fillna(0), y_train)
+        return m.predict_proba(X_valid[cols].fillna(0))[:, 1], m.predict_proba(
+            X_test[cols].fillna(0)
+        )[:, 1]
+    """
+)
+
+
+def test_extra_rows_reach_fit_predict_in_every_fold(data, tmp_path):
+    tmp, train_path, _, y, _ = data
+    train = pd.read_parquet(train_path)
+    extra = train.tail(30).copy()
+    extra["x1"] = extra["x1"] + 50.0
+    extra["id"] = -np.arange(1, 31)
+    extra_path = tmp_path / "extra.parquet"
+    extra.to_parquet(extra_path, index=False)
+    y_extra = y[-30:]
+    result = run(
+        EXTRA_AWARE,
+        data,
+        tmp_path,
+        extra_train=extra_path,
+        extra_y=y_extra,
+        extra_flag="is_original",
+    )
+    assert result.ok, result.error
+    assert result.features[-1] == "is_original" and result.oof.shape == (400,)
+    # without extras the module's own assertions fail, so the harness reports the error
+    plain = run(EXTRA_AWARE, data, tmp_path / "plain")
+    assert not plain.ok and "AssertionError" in plain.error

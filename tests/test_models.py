@@ -4,7 +4,7 @@ import pytest
 
 from aac.models.cv import cross_validate, load_or_create_folds, make_folds
 from aac.models.metrics import METRICS
-from aac.models.prepare import MISSING_CATEGORY, prepare_matrix
+from aac.models.prepare import MISSING_CATEGORY, add_flag, prepare_matrix
 from aac.models.registry import FAMILIES, supports_early_stopping
 from aac.models.target import infer_target_encoding
 from tests.synth import make_frames
@@ -146,3 +146,37 @@ def test_prepare_matrix_maps_infinities_to_nan():
     m = prepare_matrix(train, test, ["r"], [])
     assert m.X_train["r"].isna().tolist() == [False, True, True, False]
     assert m.X_test["r"].isna().tolist() == [True, False]
+
+
+def test_extra_rows_join_the_training_folds_only():
+    from aac.models.target import infer_target_encoding
+
+    train, test, _ = make_frames(600, 200, kind="binary")
+    enc = infer_target_encoding(train["target"])
+    y = enc.encode(train["target"])
+    folds = make_folds(y, 5, 0)
+    extra = train.tail(80).copy()
+    extra["x1"] = extra["x1"] + 3.0
+    extra.loc[extra.index[:5], "cat"] = "zzz"  # a level only the extra rows have
+    y_extra = enc.encode(extra["target"])
+    matrix = prepare_matrix(train, test, FEATURES, CATS, extra=extra)
+    assert matrix.n_extra == 80 and matrix.X_extra is not None
+    assert matrix.X_extra["cat"].dtype == matrix.X_train["cat"].dtype, "shared vocabulary"
+    assert "zzz" in matrix.X_train["cat"].cat.categories
+    flagged = add_flag(matrix, "is_original")
+    assert flagged.features[-1] == "is_original"
+    assert flagged.X_extra["is_original"].eq(1.0).all()
+    assert (
+        flagged.X_train["is_original"].eq(0.0).all() and flagged.X_test["is_original"].eq(0.0).all()
+    )
+    assert add_flag(matrix, None) is matrix
+    with pytest.raises(KeyError, match="collides"):
+        add_flag(flagged, "is_original")
+
+    r = run_cv("lightgbm", flagged, y, folds, extra=(flagged.X_extra, y_extra))
+    assert r.oof.shape == (600,) and r.test_pred.shape == (200,), "OOF stays on the own rows"
+    assert r.oof_score > 0.8 and "is_original" in r.importances
+    again = run_cv("lightgbm", flagged, y, folds, extra=(flagged.X_extra, y_extra))
+    np.testing.assert_allclose(r.oof, again.oof, rtol=0, atol=1e-9)
+    with pytest.raises(ValueError, match="differ in length"):
+        run_cv("logistic", flagged, y, folds, extra=(flagged.X_extra, y_extra[:3]))

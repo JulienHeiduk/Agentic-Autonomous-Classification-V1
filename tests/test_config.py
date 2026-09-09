@@ -150,3 +150,22 @@ def test_fallback_pair_validation(write_config, minimal_config):
     minimal_config["models"] = {"variants": ["encoded", "encoded"]}
     with pytest.raises(ConfigError, match="duplicates"):
         load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+
+
+def test_extra_train_config(write_config, minimal_config):
+    minimal_config["competition"]["extra_train"] = [
+        {"dataset": "owner/ev-data", "rename": {"Buyer_ID": "id"}, "dedupe": False}
+    ]
+    minimal_config["competition"]["extra_flag"] = None
+    c = load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    [spec] = c.competition.extra_train
+    assert spec.dataset == "owner/ev-data" and spec.file is None and not spec.dedupe
+    assert spec.rename == {"Buyer_ID": "id"} and c.competition.extra_flag is None
+    minimal_config["competition"]["extra_train"] = [{"dataset": "no-slash"}]
+    with pytest.raises(ConfigError, match="extra_train"):
+        load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    c = load_config(REPO / "configs" / "s6e9.yaml", strict=False, env={})
+    assert [e.dataset for e in c.competition.extra_train] == [
+        "itzzomkar/ev-adoption-behavior-and-range-anxiety"
+    ]
+    assert c.competition.extra_flag == "is_original"

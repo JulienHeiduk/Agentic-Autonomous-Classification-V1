@@ -84,11 +84,25 @@ class FilesConfig(StrictModel):
     sample_submission: str | None = None
 
 
+class ExtraData(StrictModel):
+    """A Kaggle dataset appended to the training side of every fold (README 17.2): the
+    original data a Playground competition was generated from, never validation or test."""
+
+    dataset: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")  # owner/slug
+    file: str | None = None  # a file inside the dataset; None: its only tabular file
+    rename: dict[str, str] = Field(default_factory=dict)  # dataset column -> train column
+    dedupe: bool = True  # drop rows identical to a synthetic training row
+
+
 class CompetitionConfig(StrictModel):
     slug: str = Field(min_length=1)
     target: str | None = None  # None: the Scout infers it
     id_col: str | None = None
     files: FilesConfig = FilesConfig()
+    extra_train: list[ExtraData] = Field(default_factory=list)
+    # Feature added when extra rows are present: 1 on them, 0 on the synthetic rows and test.
+    # None: no flag column.
+    extra_flag: str | None = "is_original"
     # Explicit metric override, only for when Kaggle's display name is not in the mapping
     # table. The framework never guesses a metric on its own.
     metric: MetricKey | None = None

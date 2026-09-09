@@ -625,3 +625,47 @@ def test_pending_score_does_not_fail_the_run_and_is_backfilled_later(
     assert second.status == "completed"
     with Ledger(tmp_path / "runs" / "ledger.db") as ledger:
         assert ledger.list_submissions(summary.run_id)[0]["public_score"] == 0.9
+
+
+def test_original_dataset_rows_join_every_training_fold(
+    env, tmp_path, write_config, minimal_config
+):
+    train, test, sample = make_frames(300, 100)
+    original = train.tail(40).copy().drop(columns=["id"])
+    original["x1"] = original["x1"] + 20.0
+    original.insert(0, "Buyer_ID", [f"EV{i}" for i in range(40)])
+    kaggle = FakeKaggle(
+        bundle=bundle_from_frames(train, test, sample),
+        metric="Roc Auc Score",
+        dataset=original.to_csv(index=False).encode(),
+        dataset_files=["EV_original.csv"],
+    )
+    logistic = f"HYPOTHESIS: logistic\n```python\n{LOGISTIC}\n```"
+    llm = FakeLLM({"nv.test": [logistic]})
+    minimal_config["competition"]["extra_train"] = [{"dataset": "owner/ev-data"}]
+    minimal_config["models"] = {"enabled": ["logistic", "lightgbm"], "tuning": "none"}
+    minimal_config["run"] = {"n_folds": 4, "n_jobs": 2, "max_rounds": 1}
+    minimal_config["researchers"] = [{"backend": "nvidia", "track": "linear"}]
+    config = load_config(write_config(minimal_config))
+    summary = go_llm(kaggle, llm, tmp_path, config, submit=False)
+    assert summary.status == "completed" and summary.n_extra == 40
+    default = summary.branches[0].training
+    assert default.n_extra == 40 and default.features[-1] == "is_original"
+    assert all(b.training.n_extra == 40 for b in summary.branches if b.training)
+    assert (summary.run_dir / "sandbox_extra.parquet").exists()
+    assert (
+        tmp_path / "runs" / "_data" / "datasets" / "owner__ev-data" / "EV_original.parquet"
+    ).exists()
+    [out] = summary.researchers
+    assert out.n_ok == 1
+    job = json.loads((summary.run_dir / "experiments" / out.agent / "r1" / "job.json").read_text())
+    assert (
+        job["extra_train"].endswith("sandbox_extra.parquet") and job["extra_flag"] == "is_original"
+    )
+    prompt = llm.calls("nv.test")[0]["messages"][-1]["content"]
+    assert "40 rows from the competition's original dataset" in prompt
+    assert "'is_original' is 1.0 on them" in prompt
+    assert kaggle.dataset_downloads == 1
+    # the second run reads the dataset from the cache
+    second = go_llm(kaggle, FakeLLM({"nv.test": [logistic]}), tmp_path, config, submit=False)
+    assert second.n_extra == 40 and kaggle.dataset_downloads == 1

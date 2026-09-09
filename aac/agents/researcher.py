@@ -439,11 +439,13 @@ def researcher_messages(
     ensemble_text: str = "",
     analysis: str = "",
     budget: str = "",
+    extra: str = "",
 ) -> list[dict[str, str]]:
     t = profile.target
     last = experiments[-1] if experiments else None
     return load_prompt("researcher").messages(
         budget=budget or "(not tracked)",
+        extra=extra or "(none)",
         allowed_imports=", ".join(sorted(EXPERIMENT_IMPORTS)),
         timeout=int(timeout),
         n_train=profile.n_train,
@@ -540,6 +542,9 @@ def run_researcher(
     folds,
     sandbox_train: Path,
     sandbox_test: Path,
+    sandbox_extra: Path | None = None,
+    extra_y: np.ndarray | None = None,
+    extra_flag: str | None = None,
     leaderboard: Callable[[], str] | None = None,
     notes: Callable[[], str] | None = None,
     pool: LivePool | None = None,
@@ -616,6 +621,7 @@ def run_researcher(
             ensemble_text=pool.leaderboard() if pool else "",
             analysis=_last_analysis(outcome.experiments),
             budget=budget_text(ctx.budget.remaining_seconds, timeout),
+            extra=extra_text(extra_y, extra_flag),
         )
         hypothesis, code, raw, backend, model = propose(
             router, messages, spec=spec, agent=agent, branch_id=exp_id
@@ -681,6 +687,9 @@ def run_researcher(
                 memory_mb=config.sandbox.memory_mb,
                 n_threads=config.run.n_jobs,
                 determinism_rows=config.sandbox.determinism_rows,
+                extra_train=sandbox_extra,
+                extra_y=extra_y,
+                extra_flag=extra_flag,
             )
             if result.ok:
                 result = degenerate_check(result, y, metric, config.run.degenerate_margin)
@@ -696,6 +705,9 @@ def run_researcher(
                     workdir=workdir,
                     sandbox_train=sandbox_train,
                     sandbox_test=sandbox_test,
+                    sandbox_extra=sandbox_extra,
+                    extra_y=extra_y,
+                    extra_flag=extra_flag,
                     reference=pool.score
                     if pool and pool.score is not None
                     else (outcome.best.oof_score if outcome.best else None),
@@ -797,6 +809,22 @@ def run_researcher(
         outcome.stopped_because,
     )
     return outcome
+
+
+def extra_text(extra_y: np.ndarray | None, extra_flag: str | None) -> str:
+    """What the prompt says about original-data rows in the training folds."""
+    if extra_y is None or len(extra_y) == 0:
+        return "(none)"
+    flag = (
+        f" The feature {extra_flag!r} is 1.0 on them and 0.0 on every synthetic and test row."
+        if extra_flag
+        else ""
+    )
+    return (
+        f"{len(extra_y)} rows from the competition's original dataset are appended to the "
+        "training part of every fold, never to validation or test; they are the last "
+        "meta['n_extra'] rows of X_train and y_train when fit_predict is called." + flag
+    )
 
 
 def budget_text(remaining_seconds: float, experiment_timeout: float) -> str:
@@ -966,6 +994,9 @@ def leak_check(
     reference: float | None,
     agent: str,
     round_no: int,
+    sandbox_extra: Path | None = None,
+    extra_y: np.ndarray | None = None,
+    extra_flag: str | None = None,
 ) -> ExperimentResult:
     """README section 10: a jump above ``leak_threshold`` over the best known score is re-run
     with shuffled targets; a score that still beats chance means the module leaks."""
@@ -1002,6 +1033,9 @@ def leak_check(
         memory_mb=config.sandbox.memory_mb,
         n_threads=config.run.n_jobs,
         determinism_rows=config.sandbox.determinism_rows,
+        extra_train=sandbox_extra,
+        extra_y=extra_y,
+        extra_flag=extra_flag,
     )
     if not shuffled.ok:
         log.warning(

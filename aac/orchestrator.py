@@ -48,7 +48,7 @@ from aac.config import Config, ResearcherSpec, load_config
 from aac.context import Budget, BudgetExceeded, RunContext
 from aac.exec.artifacts import RunPaths, atomic_write_json
 from aac.kaggle.api import CompetitionInfo, KaggleClient, KaggleError
-from aac.kaggle.data import ensure_data
+from aac.kaggle.data import ensure_data, ensure_dataset, load_extra_train
 from aac.ledger import Ledger
 from aac.llm.client import LLMError
 from aac.llm.router import Router
@@ -116,6 +116,7 @@ class RunSummary:
     submission_path: Path | None = None
     public_score: float | None = None
     resumed: bool = False
+    n_extra: int = 0
 
     @property
     def plan(self) -> Plan | None:
@@ -170,6 +171,13 @@ class RunData:
     folds: np.ndarray
     sandbox_train: Path
     sandbox_test: Path
+    extra_train: pd.DataFrame | None = None  # original-data rows aligned with train
+    extra_y: np.ndarray | None = None
+    sandbox_extra: Path | None = None  # target-free copy for the experiment harness
+
+    @property
+    def n_extra(self) -> int:
+        return 0 if self.extra_train is None else len(self.extra_train)
 
 
 def _stage(name: str, started: float) -> None:
@@ -191,6 +199,52 @@ def _prepare_sandbox_inputs(
         test.to_parquet(tmp, index=False)
         tmp.replace(test_path)
     return train_path, test_path
+
+
+def _prepare_sandbox_extra(ctx: RunContext, extra: pd.DataFrame, target: str) -> Path:
+    """Target-free parquet of the extra rows, next to the sandbox train and test copies."""
+    path = ctx.paths.run_dir / "sandbox_extra.parquet"
+    if not path.exists():
+        tmp = path.with_name(path.name + ".part")
+        extra.drop(columns=[target]).to_parquet(tmp, index=False)
+        tmp.replace(path)
+    return path
+
+
+def _load_extra_train(
+    ctx: RunContext, kaggle: KaggleClient, config: Config, train: pd.DataFrame, profile: Profile
+) -> tuple[pd.DataFrame | None, np.ndarray | None, Path | None]:
+    """The configured original datasets, aligned with train and encoded (README 17.2)."""
+    if not config.competition.extra_train:
+        return None, None, None
+    frames: list[pd.DataFrame] = []
+    next_id = -1
+    for spec in config.competition.extra_train:
+        parquet = ensure_dataset(
+            kaggle, spec.dataset, ctx.paths.root / "_data" / "datasets", spec.file
+        )
+        frame = load_extra_train(
+            parquet,
+            train,
+            target=profile.target.name,
+            id_col=profile.id_col,
+            rename=spec.rename,
+            dedupe=spec.dedupe,
+            first_id=next_id,
+        )
+        next_id -= len(frame)
+        frames.append(frame)
+    extra = pd.concat(frames, ignore_index=True)
+    if extra.empty:
+        log.warning("extra training data: every row was a duplicate; nothing appended")
+        return None, None, None
+    extra_y = profile.encoding().encode(extra[profile.target.name])
+    log.info(
+        "extra training rows: %d from %s, appended to every fold's training part",
+        len(extra),
+        [spec.dataset for spec in config.competition.extra_train],
+    )
+    return extra, extra_y, _prepare_sandbox_extra(ctx, extra, profile.target.name)
 
 
 def run_plan_branch(
@@ -237,6 +291,9 @@ def run_plan_branch(
             branch_dir=branch_dir,
             max_trees=config.run.max_trees,
             families=families,
+            extra=data.extra_train,
+            extra_y=data.extra_y,
+            extra_flag=config.competition.extra_flag,
         )
     except Exception as exc:  # noqa: BLE001 - recorded, the run continues
         log.exception("branch %s failed", name)
@@ -420,9 +477,21 @@ def _load_data(
     y = enc.encode(train[profile.target.name])
     folds = load_or_create_folds(ctx.paths.folds_path, y, config.run.n_folds, config.run.seed)
     sandbox_train, sandbox_test = _prepare_sandbox_inputs(ctx, train, test, profile.target.name)
+    extra_train, extra_y, sandbox_extra = _load_extra_train(ctx, kaggle, config, train, profile)
     _stage("profile", t)
     return info, RunData(
-        train, test, sample, profile, metric, y, folds, sandbox_train, sandbox_test
+        train,
+        test,
+        sample,
+        profile,
+        metric,
+        y,
+        folds,
+        sandbox_train,
+        sandbox_test,
+        extra_train=extra_train,
+        extra_y=extra_y,
+        sandbox_extra=sandbox_extra,
     )
 
 
@@ -606,6 +675,9 @@ def _research_and_submit(
                     folds=folds,
                     sandbox_train=data.sandbox_train,
                     sandbox_test=data.sandbox_test,
+                    sandbox_extra=data.sandbox_extra,
+                    extra_y=data.extra_y,
+                    extra_flag=config.competition.extra_flag,
                     pool=pool,
                     after_experiment=maybe_upload,
                     notes=lambda: render_notes(
@@ -761,6 +833,7 @@ def run(
             _backfill_scores(ctx.ledger, kaggle, config.competition.slug)
             metric_key = data.metric.key
             summary.profile = data.profile
+            summary.n_extra = data.n_extra
             ctx.ledger.add_note(
                 source="kaggle",
                 kind="competition",
@@ -866,6 +939,7 @@ def resume(
             _backfill_scores(ctx.ledger, kaggle, config.competition.slug)
             metric_key = data.metric.key
             summary.profile = data.profile
+            summary.n_extra = data.n_extra
             if config.researcher_specs():
                 _verify_backends(router)
 
@@ -991,7 +1065,11 @@ def _print_summary(console: Console, s: RunSummary, metric: str) -> None:
     if s.profile:
         p = s.profile
         rows += [
-            ("data", f"{p.n_train} train / {p.n_test} test rows, {p.n_columns} columns"),
+            (
+                "data",
+                f"{p.n_train} train / {p.n_test} test rows, {p.n_columns} columns"
+                + (f", +{s.n_extra} original rows in every training fold" if s.n_extra else ""),
+            ),
             ("target", f"{p.target.name} ({p.target.kind}, positive={p.target.positive_label!r})"),
             ("submission", f"{p.submission.kind} in {p.submission.columns}"),
         ]
@@ -1110,6 +1188,9 @@ def replay_experiment(
             workdir=paths.run_dir / "replay" / experiment_id,
             train_path=data.sandbox_train,
             test_path=data.sandbox_test,
+            extra_train=data.sandbox_extra,
+            extra_y=data.extra_y,
+            extra_flag=config.competition.extra_flag,
             y=data.y,
             folds=data.folds,
             metric=data.metric,

@@ -182,3 +182,31 @@ def test_variant_plans_from_the_profile(setup, tmp_path):
             branch_dir=tmp_path / "none",
             families=["catboost"],
         )
+
+
+def test_train_plan_appends_extra_rows(setup, tmp_path):
+    train, test, _, profile, y, folds = setup
+    enc = profile.encoding()
+    extra = train.tail(50).copy()
+    extra["x2"] = extra["x2"].fillna(0) - 5.0
+    y_extra = enc.encode(extra["target"])
+    plan = Plan(name="x", models=[ModelConfig(family="lightgbm", params={"n_estimators": 40})])
+    result = train_plan(
+        plan,
+        profile,
+        train,
+        test,
+        y,
+        folds,
+        metric=METRICS["auc"],
+        seed=1,
+        n_jobs=2,
+        branch_dir=tmp_path,
+        extra=extra.drop(columns=["target"]),
+        extra_y=y_extra,
+        extra_flag="is_original",
+    )
+    assert result.n_extra == 50 and result.features[-1] == "is_original"
+    assert "is_original" in result.results["lightgbm"].importances
+    assert np.load(tmp_path / "oof.npy").shape == (400,)
+    assert json.loads((tmp_path / "metrics.json").read_text())["n_extra"] == 50

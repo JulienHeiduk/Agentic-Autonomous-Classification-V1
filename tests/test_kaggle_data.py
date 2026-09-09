@@ -7,7 +7,14 @@ import pytest
 
 from aac.config import FilesConfig
 from aac.kaggle.api import KaggleClient
-from aac.kaggle.data import DataLayoutError, assign_roles, ensure_data, resolve_files
+from aac.kaggle.data import (
+    DataLayoutError,
+    assign_roles,
+    ensure_data,
+    ensure_dataset,
+    load_extra_train,
+    resolve_files,
+)
 from tests.kaggle_fake import SLUG, FakeKaggle
 
 
@@ -105,3 +112,73 @@ def test_ensure_data_with_override_reads_parquet(tmp_path):
     )
     train, test, sample = files.frames()
     assert list(train.columns) == ["id", "y"] and len(test) == 1 and len(sample) == 1
+
+
+def _original(train: pd.DataFrame) -> pd.DataFrame:
+    """Ten rows copied from train and fifteen fresh ones, with the dataset's own id column."""
+    fresh = train.tail(15).copy()
+    fresh["x1"] = fresh["x1"] + 100.0
+    orig = pd.concat([train.head(10), fresh], ignore_index=True).drop(columns=["id"])
+    orig = orig.rename(columns={"x3": "level"})  # the dataset's own name for x3
+    orig.insert(0, "Buyer_ID", [f"EV{i:05d}" for i in range(len(orig))])
+    orig["junk"] = "ignored"
+    return orig
+
+
+def test_ensure_dataset_caches_and_load_extra_train_aligns(tmp_path):
+    from tests.synth import make_frames
+
+    train, _, _ = make_frames(60, 20)
+    orig = _original(train)
+    fake = FakeKaggle(dataset=orig.to_csv(index=False).encode(), dataset_files=["EV.csv"])
+    kc = KaggleClient(client=httpx.Client(transport=fake.transport), access_token="KGAT_x")
+    parquet = ensure_dataset(kc, "owner/ev-data", tmp_path / "datasets", None)
+    assert parquet == tmp_path / "datasets" / "owner__ev-data" / "EV.parquet"
+    assert (tmp_path / "datasets" / "owner__ev-data" / "raw" / "EV.csv").exists()
+    again = ensure_dataset(kc, "owner/ev-data", tmp_path / "datasets", None)
+    assert again == parquet and fake.dataset_downloads == 1, "cached, not downloaded twice"
+
+    rename = {"level": "x3"}
+    with pytest.raises(DataLayoutError, match="lacks the training columns \\['x3'\\]"):
+        load_extra_train(parquet, train, target="target", id_col="id")
+    extra = load_extra_train(parquet, train, target="target", id_col="id", rename=rename)
+    assert list(extra.columns) == list(train.columns), "same columns in the same order"
+    assert len(extra) == 15, "the ten copies of synthetic rows were dropped"
+    assert extra["id"].tolist() == list(range(-1, -16, -1)), "fresh negative ids"
+    assert extra["x3"].dtype == train["x3"].dtype and extra["cat"].dtype == train["cat"].dtype
+    assert set(extra["target"]) <= set(train["target"])
+    kept = load_extra_train(
+        parquet, train, target="target", id_col="id", rename=rename, dedupe=False
+    )
+    assert len(kept) == 25
+    no_id = load_extra_train(
+        parquet, train.drop(columns=["id"]), target="target", id_col=None, rename=rename
+    )
+    assert list(no_id.columns) == [c for c in train.columns if c != "id"]
+    later = load_extra_train(
+        parquet, train, target="target", id_col="id", rename=rename, first_id=-100
+    )
+    assert later["id"].iloc[0] == -100
+    with pytest.raises(DataLayoutError, match="duplicate columns"):
+        load_extra_train(
+            parquet, train, target="target", id_col="id", rename={**rename, "junk": "x1"}
+        )
+    with pytest.raises(DataLayoutError, match="lacks the training columns"):
+        load_extra_train(
+            parquet, train.assign(other=1.0), target="target", id_col="id", rename=rename
+        )
+
+
+def test_ensure_dataset_with_several_files_needs_a_choice(tmp_path):
+    buf = __import__("io").BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.csv", "x\n1\n")
+        zf.writestr("b.csv", "x\n2\n")
+    fake = FakeKaggle(dataset=buf.getvalue(), dataset_files=["a.csv", "b.csv"])
+    kc = KaggleClient(client=httpx.Client(transport=fake.transport), access_token="KGAT_x")
+    with pytest.raises(DataLayoutError, match="several tabular files"):
+        ensure_dataset(kc, "o/two", tmp_path / "datasets", None)
+    parquet = ensure_dataset(kc, "o/two", tmp_path / "datasets", "b.csv")
+    assert pd.read_parquet(parquet)["x"].tolist() == [2]
+    with pytest.raises(DataLayoutError, match="no tabular file"):
+        ensure_dataset(kc, "o/two", tmp_path / "datasets", "c.csv")

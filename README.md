@@ -372,7 +372,8 @@ These protect the run from itself:
 
 ## 11. Config
 
-*V1 keys. V2 adds `researchers`, `scholar` (with `reuse_runs`), `assessor`,
+*V1 keys. V2 adds `competition.extra_train`, `competition.extra_flag`, `researchers`,
+`scholar` (with `reuse_runs`), `assessor`,
 `run.max_rounds`, `run.max_consecutive_failures`, `run.share_every`, `run.degenerate_margin`,
 `run.schedule`, `models.variants`, `models.variant_families`, `models.low_cardinality_max`,
 `models.seed_bag`, `models.seed_bag_top`, `models.seed_bag_max_seconds`,
@@ -585,6 +586,14 @@ Per-experiment wall-clock and memory limits come from config.
 - **Assessor** (interviews): a fixed small task per configured model, scored by CV. The
   resulting track record (valid modules, runs that succeeded, best OOF, tokens, latency)
   drives the allocation of tracks and rounds in later runs.
+- **Original data** (`competition.extra_train`): the Kaggle dataset a Playground
+  competition was generated from is downloaded once into `runs/_data/datasets/`, aligned
+  with the train columns (extra columns dropped, dtypes coerced, rows identical to a
+  synthetic row removed, fresh negative ids) and appended to the training part of every fold,
+  never to validation or test, so every OOF stays a score on the competition's own rows. A
+  flag feature (`competition.extra_flag`, default `is_original`) is 1 on those rows and 0
+  elsewhere. Deterministic branches, seed bags and Researcher modules all see them; a module
+  finds them as the last `meta["n_extra"]` rows of `X_train`.
 - **Deterministic branches**: the default plan on every enabled family, then the plan
   variants in `models.variants` on the fast families: `categorical` treats integer columns
   with at most `models.low_cardinality_max` distinct values as categorical levels, `encoded`
@@ -622,7 +631,8 @@ only that track's Researchers), `model_track_record(backend, model, task, valid_
 runs_ok, best_oof, tokens, latency, updated_at)`. Experiment `kind` values: `ok`,
 `no-code`, `track`, `rejected`, `error`, `timeout`, `leak`, `degenerate`.
 Artifacts: `runs/{run_id}/experiments/{agent}/r{round}/` with `experiment.py`, `oof.npy`,
-`test_pred.npy`, `metrics.json`, `analysis.json`, `stdout.log`.
+`test_pred.npy`, `metrics.json`, `analysis.json`, `stdout.log`. Datasets used as extra
+training data are cached under `runs/_data/datasets/{owner}__{slug}/`.
 
 ### 17.4 Build order, in the article's order (replaces items 6 to 10 of section 14)
 

@@ -24,6 +24,7 @@ the README, and note findings that change later work.
 | 13 | Track-safe knowledge, pitfalls memory, degenerate check | done | 2026-09-08 |
 | 14 | Deterministic levers, hub resilience, round-robin seats, packet reuse | done | 2026-09-08 |
 | 15 | Pending public scores, score backfill, `aac scores`, `--repeat` | done | 2026-09-09 |
+| 16 | Original dataset as extra training rows | done | 2026-09-09 |
 
 ## Done
 
@@ -529,6 +530,41 @@ default 0.94181), `encoded` 0.94167 (close but below), seed bags 0.94174 / 0.941
 stacker still gained: OOF 0.94209 and 0.94206 against 0.94200 before, public 0.94186 and
 0.94185 against 0.94178. Target encoding and level handling are not the half-point lever on
 this table.
+
+### 16. Original dataset as extra training rows (2026-09-09)
+
+The owner confirmed the S6E9 data was generated from
+`itzzomkar/ev-adoption-behavior-and-range-anxiety` (CC0, 10,000 rows). Its columns match the
+competition's exactly apart from `Buyer_ID`; target labels and rates match (17.5% Yes),
+the category vocabularies match, no row duplicates a synthetic one, and three numeric
+columns carry about 180 NaNs each. On Playground competitions this is the lever behind the
+packed top of the leaderboard, and the deterministic variants of milestone 14 had just shown
+that encoding tricks are not.
+
+- **Kaggle client**: `list_dataset_files` and `download_dataset` on
+  `datasets.DatasetApiService` (`ListDatasetFiles`, `DownloadDataset`; the download is a
+  302 to storage like the competition bundle). `download_all` and the dataset download share
+  `_download`.
+- **Data cache**: `ensure_dataset` under `runs/_data/datasets/{owner}__{slug}/` (zip or
+  single file, parquet-cached); `load_extra_train` aligns a frame with train: rename map,
+  unknown columns dropped, dtypes coerced, exact duplicates of synthetic rows removed, fresh
+  negative ids.
+- **Training**: `prepare_matrix(extra=)` builds the extra matrix with the shared category
+  vocabulary; `add_flag` appends the source flag; `cross_validate(extra=)` concatenates the
+  rows onto each fold's training part after the mask, so OOF and validation stay on the
+  competition's rows. `train_plan` passes them through and records `n_extra`.
+- **Harness**: the job carries `extra_train`, `extra_y`, `extra_flag`; the runner sends the
+  extras through `build_features` and the matrix together with train, splits them off, adds
+  the flag, and appends them to `X_train`/`y_train` in every fold and in the determinism
+  check; `meta["n_extra"]` and `meta["extra_flag"]` tell the module. Prompt v7 explains it.
+- **Orchestrator**: `_load_extra_train` runs after profiling; the sandbox gets
+  `sandbox_extra.parquet`; branches, seed bags, Researchers, the leak check and `aac replay`
+  all receive the rows; the summary's data row reports them.
+- Config: `competition.extra_train: [{dataset, file, rename, dedupe}]`,
+  `competition.extra_flag`. S6E9 config points at the dataset.
+- Tests: dataset listing and download, cache and alignment, several-file datasets, shared
+  vocabulary and flag in CV, trainer, a module that asserts the rows arrive in every fold,
+  config validation, and an end-to-end run with a cached second run.
 
 ## Reference write-up: gap analysis (2026-09-06)
 

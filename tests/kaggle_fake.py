@@ -17,6 +17,7 @@ import pandas as pd
 
 SLUG = "playground-series-s6e9"
 SERVICE = "/v1/competitions.CompetitionApiService/"
+DATASETS = "/v1/datasets.DatasetApiService/"
 STORAGE = "https://storage.googleapis.com"
 
 
@@ -65,6 +66,8 @@ class FakeKaggle:
         fail_submission: str | None = None,
         page_size: int | None = None,
         code_only: bool = False,
+        dataset: bytes | None = None,
+        dataset_files: list[str] | None = None,
     ) -> None:
         self.slug = slug
         self.metric = metric
@@ -79,6 +82,11 @@ class FakeKaggle:
         self.fail_submission = fail_submission
         self.page_size = page_size
         self.code_only = code_only
+        # A Kaggle dataset (README 17.2 extra training data): the bytes served for its
+        # download (a CSV, or a zip when several files are listed) and its file names.
+        self.dataset = dataset
+        self.dataset_files = dataset_files or ["original.csv"]
+        self.dataset_downloads = 0
         self.calls: list[str] = []
         self.uploads: dict[str, bytes] = {}
         self.tokens: list[str] = []
@@ -108,7 +116,7 @@ class FakeKaggle:
         self.calls.append(f"{request.method} {host}{path}")
         if host == "storage.googleapis.com":
             return self._storage(request)
-        if host != "api.kaggle.com" or not path.startswith(SERVICE):
+        if host != "api.kaggle.com" or not (path.startswith(SERVICE) or path.startswith(DATASETS)):
             return httpx.Response(404, text=f"unexpected {request.url}")
         if "authorization" not in request.headers or "ka_sessionid" in request.headers.get(
             "cookie", ""
@@ -124,7 +132,7 @@ class FakeKaggle:
                     }
                 },
             )
-        method = path[len(SERVICE) :]
+        method = path[len(SERVICE) :] if path.startswith(SERVICE) else path[len(DATASETS) :]
         body = json.loads(request.content or b"{}")
         fn = getattr(self, f"_{method}", None)
         if fn is None:
@@ -204,6 +212,21 @@ class FakeKaggle:
             200, json={"message": "Successfully submitted", "ref": self._next_ref}
         )
 
+    # -- datasets ---------------------------------------------------------------------------
+
+    def _ListDatasetFiles(self, body: dict) -> httpx.Response:
+        assert body["ownerSlug"] and body["datasetSlug"]
+        if self.dataset is None:
+            return httpx.Response(403, json={"code": 403, "message": "datasets.get denied"})
+        files = [{"name": n, "totalBytes": len(self.dataset)} for n in self.dataset_files]
+        return httpx.Response(200, json={"datasetFiles": files})
+
+    def _DownloadDataset(self, body: dict) -> httpx.Response:
+        assert body["ownerSlug"] and body["datasetSlug"]
+        if self.dataset is None:
+            return httpx.Response(404, text="<html>no such dataset</html>")
+        return httpx.Response(302, headers={"Location": f"{STORAGE}/dataset/download?sig=2"})
+
     # -- storage ---------------------------------------------------------------------------
 
     def _storage(self, request: httpx.Request) -> httpx.Response:
@@ -214,6 +237,12 @@ class FakeKaggle:
                 return httpx.Response(403, text="<Error><Code>SignatureDoesNotMatch</Code></Error>")
             return httpx.Response(
                 200, content=self.bundle, headers={"Content-Length": str(len(self.bundle))}
+            )
+        if request.method == "GET" and request.url.path == "/dataset/download":
+            assert self.dataset is not None
+            self.dataset_downloads += 1
+            return httpx.Response(
+                200, content=self.dataset, headers={"Content-Length": str(len(self.dataset))}
             )
         if request.method == "PUT" and request.url.path.startswith("/upload/"):
             if self.upload_503s > 0:

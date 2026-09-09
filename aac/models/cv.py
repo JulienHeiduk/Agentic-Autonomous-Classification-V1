@@ -139,8 +139,13 @@ def cross_validate(
     n_jobs: int,
     early_stopping: bool = True,
     target_encode: list[str] | None = None,
+    extra: tuple[pd.DataFrame, np.ndarray] | None = None,
 ) -> CVResult:
+    """``extra`` = (X_extra, y_extra): rows appended to the training part of every fold and
+    never to validation, so the OOF stays a score on the competition's own rows."""
     started = time.monotonic()
+    if extra is not None and len(extra[0]) != len(extra[1]):
+        raise ValueError("extra rows and their targets differ in length")
     n_folds = int(folds.max()) + 1
     oof = np.zeros((len(X), n_classes))
     test_sum = np.zeros((len(X_test), n_classes))
@@ -154,6 +159,9 @@ def cross_validate(
         train_mask = folds != k
         X_tr, y_tr = X[train_mask], y[train_mask]
         X_va, y_va = X[~train_mask], y[~train_mask]
+        if extra is not None and len(extra[0]):
+            X_tr = pd.concat([X_tr, extra[0]], ignore_index=True)
+            y_tr = np.concatenate([np.asarray(y_tr), np.asarray(extra[1])])
         X_tr, (X_va_enc, X_te_enc) = _target_encode(
             X_tr, y_tr, [X_va, X_test], te_cols, n_classes, seed
         )

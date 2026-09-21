@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import Field, ValidationInfo, model_validator
 
 from aac.config import ModelFamily, StrictModel
 
 TREE_COUNT_KEYS = ("n_estimators", "iterations", "max_iter")
+MAX_MODELS = len(get_args(ModelFamily))  # a plan may use every family once
 
 DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
     "lightgbm": {
@@ -28,6 +29,18 @@ DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
         "subsample_freq": 1,
         "colsample_bytree": 0.8,
         "reg_lambda": 1.0,
+    },
+    "lightgbm_focal": {
+        "n_estimators": 600,
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "min_child_samples": 40,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 1.0,
+        "alpha": 0.25,  # focal loss: positive-class weight
+        "gamma": 2.0,  # focal loss: how hard confident rows are down-weighted
     },
     "xgboost": {
         "n_estimators": 600,
@@ -83,7 +96,8 @@ class Plan(StrictModel):
     categorical_columns: list[str] | None = None  # None: the Scout's inference
     features: list[FeatureIdea] = Field(default_factory=list, max_length=25)
     target_encode: list[str] = Field(default_factory=list)  # fitted inside each fold
-    models: list[ModelConfig] = Field(min_length=1, max_length=5)
+    recipes: list[str] = Field(default_factory=list)  # deterministic feature recipes, in order
+    models: list[ModelConfig] = Field(min_length=1, max_length=MAX_MODELS)
 
     @model_validator(mode="after")
     def _references(self, info: ValidationInfo) -> Plan:
@@ -142,7 +156,14 @@ class Plan(StrictModel):
         return hashlib.sha256(self.canonical().encode()).hexdigest()[:16]
 
 
-BAGGABLE_FAMILIES = frozenset({"lightgbm", "xgboost", "catboost", "hist_gbdt"})
+BAGGABLE_FAMILIES = frozenset({"lightgbm", "lightgbm_focal", "xgboost", "catboost", "hist_gbdt"})
+
+
+def usable_families(families: list[str], n_classes: int) -> list[str]:
+    """The families that can fit this target: binary-only ones drop out for multiclass."""
+    from aac.models.registry import supports_multiclass
+
+    return [f for f in families if n_classes == 2 or supports_multiclass(f)]
 
 
 def low_cardinality_numeric(profile: Any, max_unique: int) -> list[str]:
@@ -197,6 +218,29 @@ def variant_plan(
             ),
             drop_columns=drops,
             target_encode=columns,
+            models=models,
+        )
+    if variant == "digits":
+        from aac.models.features import digit_columns
+
+        fine = digit_columns(profile)
+        if not fine:
+            return None
+        numeric = [
+            c.name
+            for c in profile.columns
+            if c.usable and c.kind == "numeric" and c.name != profile.id_col
+        ]
+        return Plan(
+            name="digits",
+            rationale=(
+                f"Generator artefacts: low-order digits and moduli of {fine}, how often each "
+                "exact value occurs (train, test and extra rows), and fold-internal exact-value "
+                "target encoding of every raw column. Public S6E9 notebooks reach 0.946 with this."
+            ),
+            drop_columns=drops,
+            target_encode=cats + numeric,
+            recipes=["digits", "value_frequency"],
             models=models,
         )
     raise ValueError(f"unknown plan variant {variant!r}")

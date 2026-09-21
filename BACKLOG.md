@@ -25,6 +25,8 @@ the README, and note findings that change later work.
 | 14 | Deterministic levers, hub resilience, round-robin seats, packet reuse | done | 2026-09-08 |
 | 15 | Pending public scores, score backfill, `aac scores`, `--repeat` | done | 2026-09-09 |
 | 16 | Original dataset as extra training rows | done | 2026-09-09 |
+| 17 | The digit leak: `digits` plan variant, owner notes | done | 2026-09-09 |
+| 18 | Focal-loss family, time-gated variant families | done | 2026-09-10 |
 
 ## Done
 
@@ -565,6 +567,69 @@ that encoding tricks are not.
 - Tests: dataset listing and download, cache and alignment, several-file datasets, shared
   vocabulary and flag in CV, trainer, a module that asserts the rows arrive in every fold,
   config validation, and an end-to-end run with a cached second run.
+
+### 17. The digit leak: `digits` plan variant, owner notes (2026-09-09)
+
+Run 20260909-1533, the first with the original dataset, changed nothing: XGBoost 0.94172,
+LightGBM 0.94166, stack 0.94201, public 0.94182. Checks on the data ruled out every leak of
+the usual kind: no duplicate feature rows within train, none between train and test or the
+original, no id-order signal. A tuning probe ruled out capacity: XGBoost with 8,000 trees at
+learning rate 0.01 scored 0.94179 against the default's 0.94180.
+
+The public notebooks on the competition (listed through the Kaggle kernels API) name the
+lever. A single LightGBM reaches CV 0.94606 / LB 0.94637 (najiama); a "strong baseline
+xgboost" scores 0.946 (pieego); "LB 0.94638 in 20 seconds" is a two-model rank blend and its
+author reports that a 26-model stack scored worse on the board (megayak); "Exact-Value TE +
+LightGBM" (kodaifukuda0311) and "The % 1000 Leak" (megayak) describe the mechanism: the
+synthetic generator leaks the target through the low-order digits of `Annual_Income_USD`.
+Verified here: 9.2% of rows have a round-thousand income and buy at 4.4% against 18.8%;
+exact-value target encoding of income alone scores AUC 0.71; on our folds a plain LightGBM
+goes from 0.94176 to 0.94472 with exact-value target encoding of income and commute, and to
+0.94484 with modulo features on top.
+
+- `aac/models/features.py`: target-free recipes `digits` (d1, d2, d3, % 100, % 1000 of every
+  numeric column with at least 100 distinct values, at the column's own decimal scale,
+  missing stays missing) and `value_frequency` (count of the exact value over train, test
+  and extra rows). `Plan.recipes` lists them; `train_plan` applies them before selecting
+  features.
+- `variant_plan("digits")`: both recipes plus fold-internal exact-value target encoding of
+  every raw column. S6E9 variants are now `[digits, encoded]`; the default list too.
+- `competition.notes`: owner knowledge written as a `competition` note from source `owner`,
+  read by every Researcher every round. The S6E9 config carries the leak description so the
+  LLM seats can exploit it inside `fit_predict`.
+- Tests: integer scale detection, digit and frequency columns with missing values and extra
+  rows, the variant plan and its training, config, and the note reaching the prompt.
+
+**Also learned:** early stopping on the validation fold inflates OOF and misleads a stacker
+(the public author's 26-model result); this harness stops on a carve-out of the training
+fold, which is the right call. Keep it.
+
+### 18. Focal-loss family, time-gated variant families (2026-09-10)
+
+Run 20260909-1922 with the digits variant: best single 0.94546, stack 0.94561, public
+0.94577 (rank 430 of 1378, from 687 of 1210). Three further runs on the same config landed on
+0.94561 / 0.94577 to 0.94579: the deterministic branches are bit-identical from run to run,
+and pooling every unique model of the last eleven runs (91 members) gained 0.00003 OOF over
+the last run alone. The blend is carried by four digits models; everything else is
+redundant. The next gain has to come from a model that ranks rows differently.
+
+Two changes that hold for any table, nothing competition-specific:
+
+- **`lightgbm_focal`**: LightGBM with a focal-loss objective (exact gradient, positive
+  approximate Hessian, `alpha` 0.25, `gamma` 2.0 in `DEFAULT_PARAMS`), early-stopped on AUC,
+  probabilities from the raw score. Binary targets only: `usable_families` drops it for
+  multiclass in the default plan and the variants, and `supports_multiclass` reports it. In
+  the default family list of both configs and baggable.
+- **Time-gated variant families**: `models.variant_families` is now optional; by default the
+  variants run on every enabled family whose default-plan training took at most
+  `models.variant_max_seconds` (120), the same rule seed bags use. On S6E9 that adds
+  hist_gbdt, logistic and the focal LightGBM to the digits and encoded plans at about a
+  minute, and keeps CatBoost out.
+- Tests: the objective reduces to weighted log loss at gamma 0, its Hessian stays positive,
+  the focal model scores and ranks differently from plain LightGBM (correlation below
+  0.9999), multiclass is refused, variants skip when nothing is fast and obey a pinned list.
+
+Not done, on purpose: the exact-value smoothing sweep is a Playground artefact and stays out.
 
 ## Reference write-up: gap analysis (2026-09-06)
 

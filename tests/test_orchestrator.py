@@ -69,17 +69,20 @@ def test_end_to_end_label_competition(env, tmp_path, write_config, minimal_confi
         assert b["id"] == branch_ledger_id(summary.run_id, DEFAULT_BRANCH_NAME)
         assert b["status"] == "promoted" and b["cv_mean"] > 0.8 and len(b["fold_scores"]) == 4
         assert b["plan_json"]["name"] == "default" and b["plan_hash"] == summary.plan.hash()
-        # deterministic variants (lightgbm only: xgboost is not enabled here) and seed bags
+        # deterministic variants on every family that was fast on the default plan (both
+        # enabled ones here), then seed bags of the tree family only
         names = [x.name for x in summary.branches]
-        assert names[:3] == [DEFAULT_BRANCH_NAME, "b01-categorical", "b02-encoded"]
+        assert names[:3] == [DEFAULT_BRANCH_NAME, "b01-digits", "b02-encoded"]
         assert [n.rsplit("-", 1)[-1] for n in names[3:]] == ["s43", "s43", "s44", "s44"]
         assert all(x.status == "promoted" for x in summary.branches)
-        assert summary.branches[1].plan.categorical_columns == ["cat", "flag", "x3"]
+        assert summary.branches[1].plan.recipes == ["digits", "value_frequency"]
+        assert "x1__freq" in summary.branches[1].training.features
+        assert set(summary.branches[1].training.results) == {"logistic", "lightgbm"}
         assert summary.branches[2].plan.target_encode == ["cat", "flag", "x3"]
         assert {x.seed for x in summary.branches[3:]} == {43, 44}
         assert all(set(x.training.results) == {"lightgbm"} for x in summary.branches[3:])
         assert len(branches) == 7 and all(r["status"] == "promoted" for r in branches)
-        assert len(summary.ensemble.members) == 2 + 2 + 4
+        assert len(summary.ensemble.members) == 2 + 2 * 2 + 4
         [sub] = ledger.list_submissions(summary.run_id)
         assert sub["public_score"] == 0.83 and sub["oof_score"] == summary.ensemble.best.oof_score
 
@@ -643,6 +646,7 @@ def test_original_dataset_rows_join_every_training_fold(
     logistic = f"HYPOTHESIS: logistic\n```python\n{LOGISTIC}\n```"
     llm = FakeLLM({"nv.test": [logistic]})
     minimal_config["competition"]["extra_train"] = [{"dataset": "owner/ev-data"}]
+    minimal_config["competition"]["notes"] = ["the digits of x1 carry the target"]
     minimal_config["models"] = {"enabled": ["logistic", "lightgbm"], "tuning": "none"}
     minimal_config["run"] = {"n_folds": 4, "n_jobs": 2, "max_rounds": 1}
     minimal_config["researchers"] = [{"backend": "nvidia", "track": "linear"}]
@@ -664,8 +668,37 @@ def test_original_dataset_rows_join_every_training_fold(
     )
     prompt = llm.calls("nv.test")[0]["messages"][-1]["content"]
     assert "40 rows from the competition's original dataset" in prompt
+    assert "[competition from owner] the digits of x1 carry the target" in prompt
     assert "'is_original' is 1.0 on them" in prompt
     assert kaggle.dataset_downloads == 1
     # the second run reads the dataset from the cache
     second = go_llm(kaggle, FakeLLM({"nv.test": [logistic]}), tmp_path, config, submit=False)
     assert second.n_extra == 40 and kaggle.dataset_downloads == 1
+
+
+def test_variant_families_are_time_gated_or_pinned(env, tmp_path, write_config, minimal_config):
+    train, test, sample = make_frames(300, 100)
+    kaggle = FakeKaggle(bundle=bundle_from_frames(train, test, sample), metric="Roc Auc Score")
+    # nothing trains within a microsecond: the variants are skipped, seed bags still run
+    config = fast_config(
+        write_config,
+        minimal_config,
+        models={"enabled": ["logistic", "lightgbm"], "tuning": "none", "variant_max_seconds": 1e-6},
+    )
+    summary = go(kaggle, tmp_path, config, submit=False)
+    names = [b.name for b in summary.branches]
+    assert names == [DEFAULT_BRANCH_NAME, "b01-default-s43", "b02-default-s44"]
+    # a pinned list ignores the clock
+    config = fast_config(
+        write_config,
+        minimal_config,
+        models={
+            "enabled": ["logistic", "lightgbm"],
+            "tuning": "none",
+            "variant_families": ["logistic"],
+            "variant_max_seconds": 1e-6,
+        },
+    )
+    summary = go(kaggle, tmp_path, config, submit=False)
+    variants = [b for b in summary.branches if b.plan.name in ("digits", "encoded")]
+    assert len(variants) == 2 and all(set(b.training.results) == {"logistic"} for b in variants)

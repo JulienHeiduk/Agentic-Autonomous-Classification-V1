@@ -15,7 +15,8 @@ import pandas as pd
 
 from aac.models.prepare import MISSING_CATEGORY
 
-EARLY_STOPPING_FAMILIES = frozenset({"lightgbm", "xgboost", "catboost"})
+EARLY_STOPPING_FAMILIES = frozenset({"lightgbm", "lightgbm_focal", "xgboost", "catboost"})
+BINARY_ONLY_FAMILIES = frozenset({"lightgbm_focal"})
 
 
 class Estimator(Protocol):
@@ -100,6 +101,67 @@ class LightGBM(_Base):
 
     def predict_proba(self, X):
         return _full_proba(self.model.predict_proba(X), self.n_classes)
+
+    def importances(self):
+        return self._named(self.model.booster_.feature_importance(importance_type="gain"))
+
+
+def focal_objective(alpha: float, gamma: float):
+    """Focal loss (Lin et al. 2017) for LightGBM's scikit-learn API: ``(y_true, raw) ->
+    (grad, hess)``. Confident rows are down-weighted by ``(1 - p_t) ** gamma``; ``alpha``
+    weights the positive class. The gradient is exact; the Hessian is the modulating factor
+    times the logistic Hessian, which keeps it positive (the exact one is not)."""
+
+    def objective(y_true: np.ndarray, raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(y_true, dtype=np.float64)
+        p = 1.0 / (1.0 + np.exp(-np.asarray(raw, dtype=np.float64)))
+        p = np.clip(p, 1e-7, 1.0 - 1e-7)
+        sign = 2.0 * y - 1.0
+        p_t = np.where(y == 1.0, p, 1.0 - p)
+        a_t = np.where(y == 1.0, alpha, 1.0 - alpha)
+        modulating = (1.0 - p_t) ** gamma
+        grad = sign * a_t * modulating * (gamma * p_t * np.log(p_t) - (1.0 - p_t))
+        hess = np.maximum(a_t * modulating * p_t * (1.0 - p_t), 1e-7)
+        return grad, hess
+
+    return objective
+
+
+class LightGBMFocal(_Base):
+    """LightGBM trained with focal loss: it ranks rows differently from every log-loss
+    model, which is what a blend needs. Binary targets only. ``alpha`` and ``gamma`` are
+    read from the params; the rest are LightGBM's."""
+
+    def fit(self, X, y, X_es=None, y_es=None):
+        import lightgbm as lgb
+
+        if not self.binary:
+            raise ValueError("lightgbm_focal handles binary targets only")
+        params = dict(self.params)
+        alpha = float(params.pop("alpha", 0.25))
+        gamma = float(params.pop("gamma", 2.0))
+        self._features = list(X.columns)
+        self.model = lgb.LGBMClassifier(
+            **params,
+            objective=focal_objective(alpha, gamma),
+            random_state=self.seed,
+            n_jobs=self.n_jobs,
+            deterministic=True,
+            force_row_wise=True,
+            verbose=-1,
+        )
+        kwargs: dict[str, Any] = {"categorical_feature": "auto"}
+        if X_es is not None:
+            kwargs["eval_X"] = X_es
+            kwargs["eval_y"] = y_es
+            kwargs["eval_metric"] = "auc"  # rank-based, so raw scores are fine
+            kwargs["callbacks"] = [lgb.early_stopping(50, verbose=False)]
+        self.model.fit(X, y, **kwargs)
+        self._best_iteration = int(self.model.best_iteration_ or 0) or None
+
+    def predict_proba(self, X):
+        raw = np.asarray(self.model.predict(X, raw_score=True), dtype=np.float64)
+        return _full_proba(1.0 / (1.0 + np.exp(-raw)), self.n_classes)
 
     def importances(self):
         return self._named(self.model.booster_.feature_importance(importance_type="gain"))
@@ -257,6 +319,7 @@ class Logistic(_Base):
 
 FAMILIES: dict[str, type[_Base]] = {
     "lightgbm": LightGBM,
+    "lightgbm_focal": LightGBMFocal,
     "xgboost": XGBoost,
     "catboost": CatBoost,
     "hist_gbdt": HistGBDT,
@@ -284,3 +347,7 @@ def build_model(
 
 def supports_early_stopping(family: str) -> bool:
     return family in EARLY_STOPPING_FAMILIES
+
+
+def supports_multiclass(family: str) -> bool:
+    return family not in BINARY_ONLY_FAMILIES

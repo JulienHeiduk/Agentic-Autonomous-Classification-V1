@@ -98,7 +98,9 @@ def test_shipped_s6e9_config_loads():
     nvidia = c.backends["nvidia"]
     assert nvidia.fallback_backend == "nvidia" and nvidia.fallback_model
     assert nvidia.trip_after == 2 and c.sandbox.experiment_timeout_seconds == 900
-    assert c.models.variants == ["categorical", "encoded"] and c.models.seed_bag == 2
+    assert c.models.variants == ["digits", "encoded"] and c.models.seed_bag == 2
+    assert c.models.variant_families is None and c.models.variant_max_seconds == 120
+    assert "lightgbm_focal" in c.models.enabled
     assert c.scholar is not None and c.scholar.reuse_runs == 3
     assert c.run.schedule == "round_robin"
     assert c.router.reason == "nvidia"
@@ -169,3 +171,14 @@ def test_extra_train_config(write_config, minimal_config):
         "itzzomkar/ev-adoption-behavior-and-range-anxiety"
     ]
     assert c.competition.extra_flag == "is_original"
+
+
+def test_owner_notes_and_digits_variant_config(write_config, minimal_config):
+    minimal_config["competition"]["notes"] = ["income digits leak the target"]
+    minimal_config["models"] = {"variants": ["digits"]}
+    c = load_config(write_config(minimal_config), env={"NV_KEY": "k"})
+    assert c.competition.notes == ["income digits leak the target"]
+    assert c.models.variants == ["digits"]
+    shipped = load_config(REPO / "configs" / "s6e9.yaml", strict=False, env={})
+    assert shipped.models.variants == ["digits", "encoded"]
+    assert any("Annual_Income_USD" in n for n in shipped.competition.notes)

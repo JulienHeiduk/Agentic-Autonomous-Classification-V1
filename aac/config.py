@@ -71,7 +71,7 @@ class StrictModel(BaseModel):
 
 
 MetricKey = Literal["auc", "accuracy", "logloss", "f1", "macro_f1"]
-ModelFamily = Literal["lightgbm", "xgboost", "catboost", "hist_gbdt", "logistic"]
+ModelFamily = Literal["lightgbm", "lightgbm_focal", "xgboost", "catboost", "hist_gbdt", "logistic"]
 Tier = Literal["cheap", "code", "reason"]
 TIERS: tuple[Tier, ...] = get_args(Tier)
 
@@ -103,6 +103,9 @@ class CompetitionConfig(StrictModel):
     # Feature added when extra rows are present: 1 on them, 0 on the synthetic rows and test.
     # None: no flag column.
     extra_flag: str | None = "is_original"
+    # What the owner knows about this competition (a leak, a trick, a trap): each entry
+    # becomes a note every Researcher reads in every round.
+    notes: list[str] = Field(default_factory=list)
     # Explicit metric override, only for when Kaggle's display name is not in the mapping
     # table. The framework never guesses a metric on its own.
     metric: MetricKey | None = None
@@ -132,7 +135,7 @@ class RunConfig(StrictModel):
     max_classes: int = Field(50, ge=2)  # more distinct target values than this is refused
 
 
-PlanVariant = Literal["categorical", "encoded"]
+PlanVariant = Literal["categorical", "encoded", "digits"]
 
 
 class ModelsConfig(StrictModel):
@@ -142,8 +145,11 @@ class ModelsConfig(StrictModel):
     # Deterministic plan variants trained after the default plan (README 17.2): "categorical"
     # treats low-cardinality integer columns as categorical; "encoded" target-encodes the
     # categoricals and those integers inside each fold. Only variant_families run on them.
-    variants: list[PlanVariant] = Field(default_factory=lambda: ["categorical", "encoded"])
-    variant_families: list[ModelFamily] = Field(default_factory=lambda: ["lightgbm", "xgboost"])
+    variants: list[PlanVariant] = Field(default_factory=lambda: ["digits", "encoded"])
+    # None: every enabled family whose default-plan training took at most
+    # variant_max_seconds; a list pins the families regardless of time.
+    variant_families: list[ModelFamily] | None = None
+    variant_max_seconds: float = Field(120, gt=0)
     low_cardinality_max: int = Field(50, ge=2)  # numeric columns with at most this many values
     # Seed bagging: the best seed_bag_top tree families are retrained with seed_bag extra seeds
     # and every replica joins the pool. 0 disables. Families slower than seed_bag_max_seconds

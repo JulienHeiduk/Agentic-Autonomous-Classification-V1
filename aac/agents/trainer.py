@@ -20,6 +20,7 @@ import pandas as pd
 from aac.agents.scout import Profile
 from aac.exec.artifacts import atomic_write_bytes, atomic_write_json
 from aac.models.cv import CVResult, cross_validate
+from aac.models.features import apply_recipes
 from aac.models.metrics import MetricSpec, score
 from aac.models.prepare import Matrix, add_flag, prepare_matrix
 from aac.plan import Plan
@@ -125,6 +126,7 @@ def train_plan(
     rows (with ``extra_y``) join the training part of every fold, never validation."""
     started = time.monotonic()
     n_classes = len(profile.target.classes)
+    train, test, extra, recipe_columns = apply_recipes(plan.recipes, profile, train, test, extra)
     features, categorical = select_features(plan, profile, train, test)
     matrix: Matrix = prepare_matrix(train, test, features, categorical, extra=extra)
     matrix = add_flag(matrix, extra_flag)
@@ -136,13 +138,15 @@ def train_plan(
     if not models:
         raise ValueError(f"plan {plan.name!r} has none of the families {families}")
     log.info(
-        "training plan %s (seed %d): %d features (%d categorical, %d target-encoded), "
-        "%d rows + %d extra, %d families",
+        "training plan %s (seed %d): %d features (%d categorical, %d target-encoded, "
+        "%d from recipes %s), %d rows + %d extra, %d families",
         plan.name,
         seed,
         len(features),
         len(categorical),
         len(plan.target_encode),
+        len(recipe_columns),
+        plan.recipes,
         len(train),
         matrix.n_extra,
         len(models),

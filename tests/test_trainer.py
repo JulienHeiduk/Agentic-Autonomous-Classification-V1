@@ -210,3 +210,98 @@ def test_train_plan_appends_extra_rows(setup, tmp_path):
     assert "is_original" in result.results["lightgbm"].importances
     assert np.load(tmp_path / "oof.npy").shape == (400,)
     assert json.loads((tmp_path / "metrics.json").read_text())["n_extra"] == 50
+
+
+def test_feature_recipes_and_the_digits_variant(setup, tmp_path):
+    import pandas as pd
+
+    from aac.models.features import apply_recipes, digit_columns, integer_scale
+    from aac.plan import variant_plan
+
+    train, test, sample, profile, y, folds = setup
+    assert integer_scale(pd.Series([12.0, 7.0, 3.0])) == 1
+    assert integer_scale(pd.Series([1.5, 2.25, 3.0])) == 100
+    assert integer_scale(pd.Series([0.12345, 1.0])) is None
+    assert integer_scale(pd.Series([np.nan, np.nan])) is None
+    # x1 and x2 have hundreds of distinct values but many decimals: eligible by count, yet the
+    # recipe finds no integer scale for them and adds no digit columns, only frequencies
+    assert digit_columns(profile) == ["x1", "x2"]
+    assert digit_columns(profile, min_distinct=1000) == []
+    plain = variant_plan("digits", profile, ["lightgbm"], 50)
+    assert plain is not None and plain.recipes == ["digits", "value_frequency"]
+    plain_new = apply_recipes(plain.recipes, profile, train, test, None)[3]
+    assert not any(c.endswith("__d1") for c in plain_new) and "x1__freq" in plain_new
+
+    # give the table a fine-grained income-like column and profile it again
+    train2, test2 = train.copy(), test.copy()
+    rng = np.random.default_rng(0)
+    train2["income"] = rng.integers(20, 200, len(train2)) * 1000.0 + rng.integers(
+        0, 1000, len(train2)
+    )
+    test2["income"] = rng.integers(20, 200, len(test2)) * 1000.0 + rng.integers(0, 1000, len(test2))
+    train2.loc[train2.index[:3], "income"] = np.nan
+    from aac.agents.scout import profile_data
+    from aac.config import CompetitionConfig
+
+    profile2 = profile_data(
+        train2,
+        test2,
+        sample,
+        slug="s",
+        competition=CompetitionConfig(slug="s"),
+        metric=METRICS["auc"],
+        max_classes=50,
+        seed=1,
+    )
+    assert digit_columns(profile2) == ["x1", "x2", "income"]
+    extra = train2.tail(20).drop(columns=["target"])
+    tr_out, te_out, ex_out, new = apply_recipes(
+        ["digits", "value_frequency"], profile2, train2, test2, extra
+    )
+    assert "income__d1" in new and "income__mod1000" in new and "cat__freq" in new
+    assert len(tr_out) == len(train2) and len(ex_out) == 20 and "income__freq" in ex_out.columns
+    v = train2["income"].iloc[5]
+    assert (
+        tr_out["income__mod1000"].iloc[5] == v % 1000
+        and tr_out["income__d2"].iloc[5] == v // 10 % 10
+    )
+    assert np.isnan(tr_out["income__d1"].iloc[0]), "missing values stay missing"
+    # frequency counts the exact value over train, test and extra rows together
+    all_cat = pd.concat([train2["cat"], test2["cat"], extra["cat"]])
+    assert (
+        tr_out["cat__freq"].iloc[7]
+        == (all_cat.fillna("__missing__") == train2["cat"].fillna("__missing__").iloc[7]).sum()
+    )
+    assert apply_recipes([], profile2, train2, test2, None)[3] == []
+    with pytest.raises(ValueError, match="unknown feature recipes"):
+        apply_recipes(["ghost"], profile2, train2, test2, None)
+
+    plan = variant_plan("digits", profile2, ["lightgbm"], 50)
+    assert plan.name == "digits" and plan.recipes == ["digits", "value_frequency"]
+    assert "income" in plan.target_encode and "cat" in plan.target_encode
+    result = train_plan(
+        plan,
+        profile2,
+        train2,
+        test2,
+        y,
+        folds,
+        metric=METRICS["auc"],
+        seed=1,
+        n_jobs=2,
+        branch_dir=tmp_path / "digits",
+    )
+    assert (
+        "income__mod1000" in result.features
+        and "income__te" in result.results["lightgbm"].importances
+    )
+    assert result.results["lightgbm"].oof_score > 0.8
+
+
+def test_usable_families_drop_binary_only_ones_for_multiclass():
+    from aac.plan import BAGGABLE_FAMILIES, DEFAULT_PARAMS, usable_families
+
+    families = ["lightgbm", "lightgbm_focal", "xgboost", "logistic"]
+    assert usable_families(families, 2) == families
+    assert usable_families(families, 3) == ["lightgbm", "xgboost", "logistic"]
+    assert "lightgbm_focal" in BAGGABLE_FAMILIES and "alpha" in DEFAULT_PARAMS["lightgbm_focal"]

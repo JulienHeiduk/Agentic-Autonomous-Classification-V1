@@ -18,7 +18,7 @@ run:
   max_rounds: 4              # experiments per Researcher
 
 models:
-  enabled: [lightgbm, xgboost, catboost, hist_gbdt, logistic]
+  enabled: [lightgbm, lightgbm_focal, xgboost, catboost, hist_gbdt, logistic]
   tuning: optuna
   tuning_trials: 30
 

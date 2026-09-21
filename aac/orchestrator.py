@@ -54,7 +54,7 @@ from aac.llm.client import LLMError
 from aac.llm.router import Router
 from aac.models.cv import load_or_create_folds
 from aac.models.metrics import MetricSpec, resolve_metric
-from aac.plan import BAGGABLE_FAMILIES, Plan, default_plan, variant_plan
+from aac.plan import BAGGABLE_FAMILIES, Plan, default_plan, usable_families, variant_plan
 
 log = logging.getLogger(__name__)
 
@@ -316,16 +316,38 @@ def run_plan_branch(
 
 
 def run_default_branch(ctx: RunContext, data: RunData, *, dry_run: bool) -> BranchOutcome:
-    plan = default_plan(list(ctx.config.models.enabled), data.profile.unusable_columns())
+    families = usable_families(list(ctx.config.models.enabled), len(data.profile.target.classes))
+    plan = default_plan(families, data.profile.unusable_columns())
     return run_plan_branch(ctx, data, name=DEFAULT_BRANCH_NAME, plan=plan, dry_run=dry_run)
 
 
-def run_variant_branches(
-    ctx: RunContext, data: RunData, *, start_index: int
-) -> list[BranchOutcome]:
-    """The deterministic plan variants (README 17.2): levels as categoricals, target encoding."""
+def variant_families(ctx: RunContext, data: RunData, default: BranchOutcome | None) -> list[str]:
+    """Families for the variants: the configured list, or every enabled family that trained
+    within ``variant_max_seconds`` on the default plan (so a slow family costs nothing)."""
     cfg = ctx.config.models
-    families = [f for f in cfg.variant_families if f in cfg.enabled]
+    n_classes = len(data.profile.target.classes)
+    if cfg.variant_families is not None:
+        return usable_families([f for f in cfg.variant_families if f in cfg.enabled], n_classes)
+    if default is None or default.training is None:
+        return []
+    fast = [
+        family
+        for family, r in default.training.results.items()
+        if r.duration <= cfg.variant_max_seconds
+    ]
+    return usable_families([f for f in cfg.enabled if f in fast], n_classes)
+
+
+def run_variant_branches(
+    ctx: RunContext, data: RunData, *, start_index: int, default: BranchOutcome | None = None
+) -> list[BranchOutcome]:
+    """The deterministic plan variants (README 17.2): levels as categoricals, target encoding,
+    generator digits; on the families that are fast on this table."""
+    cfg = ctx.config.models
+    families = variant_families(ctx, data, default)
+    if not families:
+        log.info("variants: no family trained within %.0fs; skipped", cfg.variant_max_seconds)
+        return []
     outcomes: list[BranchOutcome] = []
     for variant in cfg.variants:
         plan = variant_plan(variant, data.profile, families, cfg.low_cardinality_max)
@@ -379,7 +401,9 @@ def train_branches(ctx: RunContext, data: RunData, summary: RunSummary) -> None:
     summary.branches.append(run_default_branch(ctx, data, dry_run=False))
     _stage("default", t)
     t = time.monotonic()
-    variants = run_variant_branches(ctx, data, start_index=len(summary.branches))
+    variants = run_variant_branches(
+        ctx, data, start_index=len(summary.branches), default=summary.branches[0]
+    )
     summary.branches.extend(variants)
     if variants:
         _stage("variants", t)
@@ -843,6 +867,10 @@ def run(
                     f"{info.metric_name}. Deadline: {info.deadline}."
                 ).strip(),
             )
+            for note in config.competition.notes:
+                ctx.ledger.add_note(
+                    source="owner", kind="competition", run_id=ctx.run_id, text=note
+                )
             if config.researcher_specs():
                 _verify_backends(router)
 

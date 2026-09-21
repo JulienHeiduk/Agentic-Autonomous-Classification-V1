@@ -9,6 +9,14 @@ competition:
   extra_train:
     - dataset: itzzomkar/ev-adoption-behavior-and-range-anxiety
   extra_flag: is_original
+  # Known from public notebooks on this competition (2026-09-09): the synthetic generator
+  # leaks the target through the low-order digits of Annual_Income_USD. Rows whose income is
+  # a round thousand buy at 4.4% against 18.8% for the rest; the exact income value,
+  # target-encoded inside the fold, alone scores AUC 0.71. Single LightGBMs reach 0.946 with
+  # digit, modulo, value-frequency and exact-value target-encoding features; stacking many
+  # models does not help. Researchers read this every round.
+  notes:
+    - "Generator artefact on this table: the low-order digits of Annual_Income_USD carry the target. Income % 1000 == 0 rows buy at 4.4% versus 18.8%. Use digit features (income % 10, // 10 % 10, // 100 % 10, % 100, % 1000), the same for Daily_Commute_km * 10, the frequency of each exact value over train plus test, and exact-value target encoding of Annual_Income_USD and Daily_Commute_km fitted on the training fold only (light smoothing; heavy smoothing washes the signal out). Public single LightGBMs score 0.946 this way; blends of many correlated models do not add to it."
 
 run:
   seed: 42
@@ -23,13 +31,13 @@ run:
   max_rounds: 4              # experiments per Researcher
 
 models:
-  enabled: [lightgbm, xgboost, catboost, hist_gbdt, logistic]
+  enabled: [lightgbm, lightgbm_focal, xgboost, catboost, hist_gbdt, logistic]
   tuning: optuna
   tuning_trials: 30
   # Deterministic variants after the default plan (README 17.2): low-cardinality integers as
   # categorical levels, and fold-internal target encoding. Fast families only.
-  variants: [categorical, encoded]
-  variant_families: [lightgbm, xgboost]
+  variants: [digits, encoded]      # digits: the generator's digit leak; see competition.notes
+  variant_max_seconds: 120       # variants run on every family this fast on the default plan
   low_cardinality_max: 50
   # Seed bags of the two best fast tree families: honest diversity the stacker can use.
   seed_bag: 2

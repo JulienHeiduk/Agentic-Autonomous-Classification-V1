@@ -372,10 +372,12 @@ These protect the run from itself:
 
 ## 11. Config
 
-*V1 keys. V2 adds `competition.extra_train`, `competition.extra_flag`, `researchers`,
+*V1 keys. V2 adds `competition.extra_train`, `competition.extra_flag`, `competition.notes`,
+`researchers`,
 `scholar` (with `reuse_runs`), `assessor`,
 `run.max_rounds`, `run.max_consecutive_failures`, `run.share_every`, `run.degenerate_margin`,
-`run.schedule`, `models.variants`, `models.variant_families`, `models.low_cardinality_max`,
+`run.schedule`, `models.variants`, `models.variant_families`, `models.variant_max_seconds`,
+`models.low_cardinality_max`,
 `models.seed_bag`, `models.seed_bag_top`, `models.seed_bag_max_seconds`,
 `backends.*.fallback_backend`, `backends.*.fallback_model`, `backends.*.trip_after`,
 `backends.*.cooldown_seconds`, `sandbox.experiment_timeout_seconds`,
@@ -578,6 +580,8 @@ Per-experiment wall-clock and memory limits come from config.
 - **Schedule**: seats play round-robin (`run.schedule`): every seat gets round n before any
   seat gets round n+1, so a slow or failing seat cannot starve the others of the wall clock.
   Each prompt carries the minutes left for the whole team.
+- **Owner notes** (`competition.notes`): what the owner knows about the competition, a leak
+  or a trap, written as a note every Researcher reads in every round.
 - **Scholar** (LLM, research packets): the strongest slow hub model, asked for feature and
   modelling ideas only, no code. Stored as notes that every Researcher reads, with the ideas
   about libraries outside the reader's track stripped at prompt time. Packets describe the
@@ -594,11 +598,17 @@ Per-experiment wall-clock and memory limits come from config.
   flag feature (`competition.extra_flag`, default `is_original`) is 1 on those rows and 0
   elsewhere. Deterministic branches, seed bags and Researcher modules all see them; a module
   finds them as the last `meta["n_extra"]` rows of `X_train`.
-- **Deterministic branches**: the default plan on every enabled family, then the plan
-  variants in `models.variants` on the fast families: `categorical` treats integer columns
+- **Deterministic branches**: the default plan on every enabled family (`lightgbm`,
+  `lightgbm_focal`, `xgboost`, `catboost`, `hist_gbdt`, `logistic`; the focal-loss LightGBM
+  is a second loss that ranks rows differently, binary targets only), then the plan variants
+  in `models.variants` on every family that trained within `models.variant_max_seconds` on
+  the default plan, or on `models.variant_families` when set: `categorical` treats integer columns
   with at most `models.low_cardinality_max` distinct values as categorical levels, `encoded`
   target-encodes the categoricals and those integers inside each fold (the integers keep
-  their numeric column too). Then seed bags: the best `models.seed_bag_top` tree families
+  their numeric column too), `digits` goes after generator artefacts: low-order digits and
+  moduli of every fine-grained numeric column, the frequency of each exact value over train,
+  test and extra rows, and fold-internal exact-value target encoding of every raw column
+  (`aac/models/features.py`). Then seed bags: the best `models.seed_bag_top` tree families
   are retrained with `models.seed_bag` extra seeds. Every family of every branch is a pool
   member. No LLM is involved, so these levers are tested on every run at a fixed cost.
 - **Ensembler**: the pool holds every experiment's OOF and test predictions across rounds

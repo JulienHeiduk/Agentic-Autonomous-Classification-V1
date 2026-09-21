@@ -5,12 +5,13 @@ import pytest
 from aac.models.cv import cross_validate, load_or_create_folds, make_folds
 from aac.models.metrics import METRICS
 from aac.models.prepare import MISSING_CATEGORY, add_flag, prepare_matrix
-from aac.models.registry import FAMILIES, supports_early_stopping
+from aac.models.registry import FAMILIES, supports_early_stopping, supports_multiclass
 from aac.models.target import infer_target_encoding
 from tests.synth import make_frames
 
 FAST = {
     "lightgbm": {"n_estimators": 80, "num_leaves": 15},
+    "lightgbm_focal": {"n_estimators": 80, "num_leaves": 15},
     "xgboost": {"n_estimators": 80, "max_depth": 4},
     "catboost": {"iterations": 100, "depth": 4},
     "hist_gbdt": {"max_iter": 40, "max_leaf_nodes": 15},
@@ -108,9 +109,13 @@ def test_family_binary_cv(family, binary):
         assert r.importances and set(r.importances) == set(FEATURES)
 
 
-@pytest.mark.parametrize("family", ["lightgbm", "xgboost", "catboost", "hist_gbdt", "logistic"])
+@pytest.mark.parametrize("family", sorted(FAMILIES))
 def test_family_multiclass_shapes(family, multiclass):
     matrix, y, folds = multiclass
+    if not supports_multiclass(family):
+        with pytest.raises(ValueError, match="binary"):
+            run_cv(family, matrix, y, folds)
+        return
     r = run_cv(family, matrix, y, folds)
     assert r.oof.shape == (600, 3) and r.test_pred.shape == (200, 3)
     np.testing.assert_allclose(r.oof.sum(axis=1), 1.0, atol=1e-6)
@@ -180,3 +185,29 @@ def test_extra_rows_join_the_training_folds_only():
     np.testing.assert_allclose(r.oof, again.oof, rtol=0, atol=1e-9)
     with pytest.raises(ValueError, match="differ in length"):
         run_cv("logistic", flagged, y, folds, extra=(flagged.X_extra, y_extra[:3]))
+
+
+def test_focal_loss_objective_and_diversity(binary):
+    from aac.models.registry import focal_objective
+
+    y = np.array([1.0, 1.0, 0.0, 0.0])
+    raw = np.array([2.0, -1.0, -2.0, 1.5])
+    p = 1 / (1 + np.exp(-raw))
+    # gamma 0 and alpha 0.5 is half the plain logistic loss: gradient (p - y) / 2
+    grad, hess = focal_objective(0.5, 0.0)(y, raw)
+    np.testing.assert_allclose(grad, (p - y) / 2, atol=1e-9)
+    np.testing.assert_allclose(hess, p * (1 - p) / 2, atol=1e-9)
+    grad, hess = focal_objective(0.25, 2.0)(y, raw)
+    assert (hess > 0).all(), "the Hessian stays positive"
+    # a wrong confident row pushes harder than a right confident one, in the right direction
+    assert grad[1] < 0 and grad[3] > 0 and abs(grad[1]) > abs(grad[0])
+    assert supports_multiclass("lightgbm") and not supports_multiclass("lightgbm_focal")
+
+    matrix, y, folds = binary
+    focal = run_cv("lightgbm_focal", matrix, y, folds)
+    plain = run_cv("lightgbm", matrix, y, folds)
+    assert focal.oof_score > 0.8 and focal.oof.min() >= 0 and focal.oof.max() <= 1
+    assert focal.importances and set(focal.importances) == set(FEATURES)
+    assert all(b is not None and b > 0 for b in focal.best_iterations)
+    corr = np.corrcoef(focal.oof, plain.oof)[0, 1]
+    assert 0.8 < corr < 0.9999, f"a different loss must rank differently (corr {corr:.5f})"

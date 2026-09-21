@@ -1,0 +1,74 @@
+# Spaceship Titanic (getting-started, perpetual): binary True/False label submission, accuracy metric.
+competition:
+  slug: spaceship-titanic
+  target: null           # null = Scout infers it
+  id_col: null
+  metric: null           # null = read from the Kaggle API; set only if the name is unmapped
+
+run:
+  seed: 42
+  n_folds: 5
+  max_iters_per_branch: 3
+  patience: 2
+  min_improvement: 0.0005
+  max_wall_clock_minutes: 180
+  max_tokens_total: 2000000
+  parallel_branches: 2
+  leak_threshold: 0.05
+  max_rounds: 4              # experiments per Researcher
+
+models:
+  enabled: [lightgbm, lightgbm_focal, xgboost, catboost, hist_gbdt, logistic]
+  tuning: optuna
+  tuning_trials: 30
+
+kaggle:
+  submit: true
+  max_submissions_per_day: 10     # Kaggle's own cap on these competitions; the API value also applies
+
+sandbox:
+  timeout_seconds: 900
+  experiment_timeout_seconds: 1800
+  memory_mb: 8192
+
+backends:
+  local:
+    base_url: ${LOCAL_LLM_BASE_URL:-http://localhost:11434/v1}
+    model: qwen2.5-coder:14b-instruct
+    api_key: null
+    cost_per_1k: 0.0
+    timeout: 180               # a stalled local model must not block a round for 20 minutes
+    max_concurrency: 1          # Ollama serialises requests per model
+  nvidia:
+    base_url: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+    model: nvidia/nemotron-3-super-120b-a12b
+    api_key: ${NVIDIA_API_KEY}
+    cost_per_1k: 0.0
+    timeout: 180               # per attempt; longest good module reply seen 144s (gpt-oss, 2026-09-06)
+    max_concurrency: 4
+    fallback_backend: nvidia   # failed hub calls retry on nemotron-super, not on the local model
+    fallback_model: nvidia/nemotron-3-super-120b-a12b
+    trip_after: 2
+    cooldown_seconds: 600
+
+# Task tier -> backend (README section 5.3).
+router:
+  cheap: local
+  code: local
+  reason: nvidia
+
+# V2 (README section 17): one Researcher per (backend, model, track). Each writes fit_predict
+# experiments run by the fold-owning harness; tracks compete and share (M8).
+researchers:
+  - { backend: nvidia, model: nvidia/nemotron-3-super-120b-a12b, track: gbdt, temperature: 0.3 }
+  - { backend: nvidia, model: nvidia/nemotron-3-super-120b-a12b, track: neural, temperature: 0.6 }
+  - { backend: nvidia, model: nvidia/nemotron-3-ultra-550b-a55b, track: open, temperature: 0.5 }
+  - { backend: local, model: qwen2.5-coder:14b-instruct, track: linear, temperature: 0.4 }
+
+# Research packets (README 17.2, the article's phase 3): ideas only, from the strongest slow model.
+scholar:
+  backend: nvidia
+  model: nvidia/nemotron-3-ultra-550b-a55b
+  temperature: 0.7
+  max_ideas: 8
+  reuse_runs: 3

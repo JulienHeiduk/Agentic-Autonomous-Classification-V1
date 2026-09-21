@@ -1,0 +1,100 @@
+# Playground Series S6E9: Predicting Electric Vehicle Purchases (binary, ROC AUC).
+competition:
+  slug: playground-series-s6e9
+  target: null           # null = Scout infers it
+  id_col: null
+  metric: null           # null = read from the Kaggle API; set only if the name is unmapped
+  # The competition data was generated from this dataset (CC0, 10,000 rows, same columns).
+  # Its rows join the training part of every fold, never validation or test (README 17.2).
+  extra_train:
+    - dataset: itzzomkar/ev-adoption-behavior-and-range-anxiety
+  extra_flag: is_original
+  # Known from public notebooks on this competition (2026-09-09): the synthetic generator
+  # leaks the target through the low-order digits of Annual_Income_USD. Rows whose income is
+  # a round thousand buy at 4.4% against 18.8% for the rest; the exact income value,
+  # target-encoded inside the fold, alone scores AUC 0.71. Single LightGBMs reach 0.946 with
+  # digit, modulo, value-frequency and exact-value target-encoding features; stacking many
+  # models does not help. Researchers read this every round.
+  notes:
+    - "Generator artefact on this table: the low-order digits of Annual_Income_USD carry the target. Income % 1000 == 0 rows buy at 4.4% versus 18.8%. Use digit features (income % 10, // 10 % 10, // 100 % 10, % 100, % 1000), the same for Daily_Commute_km * 10, the frequency of each exact value over train plus test, and exact-value target encoding of Annual_Income_USD and Daily_Commute_km fitted on the training fold only (light smoothing; heavy smoothing washes the signal out). Public single LightGBMs score 0.946 this way; blends of many correlated models do not add to it."
+
+run:
+  seed: 42
+  n_folds: 5
+  max_iters_per_branch: 3
+  patience: 2
+  min_improvement: 0.0001    # AUC gains on this table are small but real (stacker +0.0002)
+  max_wall_clock_minutes: 180
+  max_tokens_total: 2000000
+  parallel_branches: 1       # 668k-row experiments: two at once plus the local LLM exceed 24 GiB
+  leak_threshold: 0.05
+  max_rounds: 4              # experiments per Researcher
+
+models:
+  enabled: [lightgbm, lightgbm_focal, xgboost, catboost, hist_gbdt, logistic]
+  tuning: optuna
+  tuning_trials: 30
+  # Deterministic variants after the default plan (README 17.2): low-cardinality integers as
+  # categorical levels, and fold-internal target encoding. Fast families only.
+  variants: [digits, encoded]      # digits: the generator's digit leak; see competition.notes
+  variant_max_seconds: 120       # variants run on every family this fast on the default plan
+  low_cardinality_max: 50
+  # Seed bags of the two best fast tree families: honest diversity the stacker can use.
+  seed_bag: 2
+  seed_bag_top: 2
+  seed_bag_max_seconds: 120     # catboost (396 s here) is never bagged
+
+kaggle:
+  submit: true
+  max_submissions_per_day: 10     # Kaggle's own cap on these competitions; the API value also applies
+
+sandbox:
+  timeout_seconds: 900
+  experiment_timeout_seconds: 900   # a timed-out round cost 30 of 180 minutes at 1800
+  memory_mb: 8192
+
+backends:
+  local:
+    base_url: ${LOCAL_LLM_BASE_URL:-http://localhost:11434/v1}
+    model: qwen2.5-coder:14b-instruct
+    api_key: null
+    cost_per_1k: 0.0
+    timeout: 180               # a stalled local model must not block a round for 20 minutes
+    max_concurrency: 1          # Ollama serialises requests per model
+  nvidia:
+    base_url: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+    model: nvidia/nemotron-3-super-120b-a12b
+    api_key: ${NVIDIA_API_KEY}
+    cost_per_1k: 0.0
+    timeout: 180               # per attempt; longest good module reply seen 144s (gpt-oss, 2026-09-06)
+    max_concurrency: 4
+    # Failed hub calls fall over to nemotron-super on the same hub, never to the local model:
+    # qwen produced no module in any fallover round (2026-09-08). Two failed calls in a row
+    # skip the hub for ten minutes instead of retrying it four times per call.
+    fallback_backend: nvidia
+    fallback_model: nvidia/nemotron-3-super-120b-a12b
+    trip_after: 2
+    cooldown_seconds: 600
+
+# Task tier -> backend (README section 5.3).
+router:
+  cheap: local
+  code: local
+  reason: nvidia
+
+# V2 (README section 17): one Researcher per (backend, model, track). Each writes fit_predict
+# experiments run by the fold-owning harness; tracks compete and share (M8).
+# The local qwen linear seat was retired on 2026-09-08: 1 working round in 20 on this table.
+# Seats run round-robin (run.schedule) so no seat starves the others of the wall clock.
+researchers:
+  - { backend: nvidia, model: nvidia/nemotron-3-super-120b-a12b, track: gbdt, temperature: 0.3 }
+  - { backend: nvidia, model: nvidia/nemotron-3-super-120b-a12b, track: neural, temperature: 0.6 }
+  - { backend: nvidia, model: nvidia/nemotron-3-ultra-550b-a55b, track: open, temperature: 0.5 }
+
+# Research packets (README 17.2, the article's phase 3): ideas only, from the strongest slow model.
+scholar:
+  backend: nvidia
+  model: nvidia/nemotron-3-ultra-550b-a55b
+  temperature: 0.7
+  max_ideas: 8
+  reuse_runs: 3                # packets describe the competition: reuse them for 3 later runs
